@@ -27,6 +27,7 @@ class Setting
         'pwd_senior_discount_enabled', 'pwd_senior_discount_rate',
         'email_password_reset_enabled', 'email_smtp_host', 'email_smtp_port',
         'email_smtp_username', 'email_smtp_password', 'store_icon_path',
+        'wholesale_pricing_enabled',
     ];
 
     /** These are only returned by the administrator Settings controller. */

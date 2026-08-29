@@ -86,9 +86,14 @@
         $('#statExpenseCount').text(summary.expense_total > 0 ? 'in this range' : '0 recorded');
         $('#statNetProfit').text(money(summary.net_profit));
 
-        const returns = returnsSummary || { voided_count: 0, voided_amount: 0 };
-        $('#statReturns').text(money(returns.voided_amount));
-        $('#statReturnsCount').text(returns.voided_count + ' voided sale' + (returns.voided_count === 1 ? '' : 's'));
+        const returns = returnsSummary || { voided_count: 0, voided_amount: 0, refund_count: 0, refund_amount: 0, total_count: 0, total_amount: 0 };
+        $('#statReturns').text(money(returns.total_amount != null ? returns.total_amount : returns.voided_amount));
+        const voidedCount = returns.voided_count || 0;
+        const refundCount = returns.refund_count || 0;
+        const parts = [];
+        if (voidedCount > 0) parts.push(voidedCount + ' voided sale' + (voidedCount === 1 ? '' : 's'));
+        if (refundCount > 0) parts.push(refundCount + ' refund' + (refundCount === 1 ? '' : 's'));
+        $('#statReturnsCount').text(parts.length ? parts.join(', ') : '0 voided sales or refunds');
     }
 
     function renderExpenses(expenses) {
@@ -213,7 +218,7 @@
             window.print();
             window.setTimeout(function () { document.body.classList.remove('printing-report'); }, 1000);
         });
-        applyPreset('month');
+        applyPreset('today');
         window.addEventListener('pos:theme-changed', function () { loadSummary(); });
 
         $('#reportPresets').on('click', 'button', function () {

@@ -19,6 +19,7 @@
     const TYPE_BADGE = {
         purchase: 'pos-badge-success',
         sale_void: 'pos-badge-success',
+        sale_refund: 'pos-badge-success',
         sale: 'pos-badge-danger',
         purchase_cancel: 'pos-badge-danger',
         adjustment: 'pos-badge-muted',

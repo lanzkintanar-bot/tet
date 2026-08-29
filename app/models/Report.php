@@ -220,7 +220,13 @@ class Report
         }, $stmt->fetchAll());
     }
 
-    /** Voided ("returned/refunded") sales in range - count + amount, for the Returns/Refunds KPI. */
+    /**
+     * Voided sales + item-level refunds in range, for the Returns/Refunds
+     * KPI - a voided sale is a whole transaction reversed outright, while
+     * a refund (database/migration_refunds.sql) is specific returned
+     * items on an otherwise-completed sale; both represent money handed
+     * back to a customer, so the KPI combines them.
+     */
     public function returnsSummary(string $dateFrom, string $dateTo): array
     {
         $stmt = $this->db->prepare(
@@ -233,9 +239,32 @@ class Report
         $stmt->execute();
         $row = $stmt->fetch();
 
+        $refundCount = 0;
+        $refundAmount = 0.0;
+        try {
+            $refundStmt = $this->db->prepare(
+                "SELECT ISNULL(COUNT(*), 0) AS refund_count, ISNULL(SUM(r.refund_amount), 0) AS refund_amount
+                 FROM Refunds r
+                 WHERE r.created_at BETWEEN :date_from AND :date_to"
+            );
+            $refundStmt->bindValue(':date_from', $dateFrom . ' 00:00:00', PDO::PARAM_STR);
+            $refundStmt->bindValue(':date_to', $dateTo . ' 23:59:59', PDO::PARAM_STR);
+            $refundStmt->execute();
+            $refundRow = $refundStmt->fetch();
+            $refundCount = (int) $refundRow['refund_count'];
+            $refundAmount = (float) $refundRow['refund_amount'];
+        } catch (\Throwable $e) {
+            // The Refunds/RefundDetails migration hasn't been run on this
+            // database yet - fall back to voided-sales-only, same as before.
+        }
+
         return [
             'voided_count'  => (int) $row['voided_count'],
             'voided_amount' => round((float) $row['voided_amount'], 2),
+            'refund_count'  => $refundCount,
+            'refund_amount' => round($refundAmount, 2),
+            'total_count'   => (int) $row['voided_count'] + $refundCount,
+            'total_amount'  => round((float) $row['voided_amount'] + $refundAmount, 2),
         ];
     }
 }

@@ -32,7 +32,12 @@
         }
 
         rows.forEach(function (row) {
-            const low = row.quantity_on_hand <= row.stock_alert_qty;
+            const qty = Number(row.quantity_on_hand);
+            const alertQty = Number(row.stock_alert_qty);
+            let stockBadge = `<span class="badge pos-badge-muted">${qty} ${escapeHtml(row.unit)}</span>`;
+            if (qty <= 0) stockBadge = `<span class="badge pos-badge-danger">Out of stock</span>`;
+            else if (qty <= alertQty) stockBadge = `<span class="badge pos-badge-warning">${qty} ${escapeHtml(row.unit)} &middot; Low</span>`;
+
             $body.append($(`
                 <tr>
                     <td>
@@ -40,15 +45,12 @@
                         <div class="text-muted small">${escapeHtml(row.product_code)}</div>
                     </td>
                     <td>${escapeHtml(row.category_name || '-')}</td>
-                    <td>
-                        <span class="fw-medium ${low ? 'text-danger' : ''}">${row.quantity_on_hand} ${escapeHtml(row.unit)}</span>
-                        ${low ? '<span class="badge pos-badge-warning ms-1">Low</span>' : ''}
-                    </td>
+                    <td>${stockBadge}</td>
                     <td class="text-muted">${row.stock_alert_qty} ${escapeHtml(row.unit)}</td>
                     <td class="text-muted small">${escapeHtml(row.updated_at || 'Never')}</td>
                     <td class="text-end">
                         <button class="btn btn-sm pos-icon-btn-table btn-adjust"
-                                data-id="${row.product_id}" data-name="${escapeHtml(row.product_name)}"
+                                data-id="${row.product_id}" data-name="${escapeHtml(row.product_name)}" 
                                 data-qty="${row.quantity_on_hand}" title="Adjust stock">
                             <i class="bi bi-pencil-square"></i>
                         </button>

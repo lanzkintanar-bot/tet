@@ -20,6 +20,29 @@ class Product
         $this->db = Database::getConnection();
     }
 
+    /**
+     * Whether database/migration_wholesale_pricing.sql (or a fresh
+     * pos_store.sql, which now includes it) has been run. Every method
+     * that touches wholesale_price checks this first so a database that
+     * hasn't applied the migration yet gets a plain "no wholesale price"
+     * instead of a raw "invalid column name" SQL error.
+     */
+    private static ?bool $wholesaleColumnAvailable = null;
+
+    private function wholesaleColumnAvailable(): bool
+    {
+        if (self::$wholesaleColumnAvailable === null) {
+            try {
+                $stmt = $this->db->query("SELECT COL_LENGTH('dbo.Products', 'wholesale_price') AS len");
+                $row = $stmt->fetch();
+                self::$wholesaleColumnAvailable = $row && $row['len'] !== null;
+            } catch (\Throwable $e) {
+                self::$wholesaleColumnAvailable = false;
+            }
+        }
+        return self::$wholesaleColumnAvailable;
+    }
+
     public function paginate(string $search, ?int $categoryId, string $sortBy, string $sortDir, int $page, int $perPage): array
     {
         $sortBy  = in_array($sortBy, self::SORTABLE, true) ? $sortBy : 'product_name';
@@ -54,8 +77,9 @@ class Product
                        p.unit, p.stock_alert_qty, p.is_active, p.created_at,
                        p.category_id, c.category_name,
                        p.supplier_id, s.supplier_name,
-                       ISNULL(i.quantity_on_hand, 0) AS quantity_on_hand
-                FROM Products p
+                       ISNULL(i.quantity_on_hand, 0) AS quantity_on_hand"
+                . ($this->wholesaleColumnAvailable() ? ", p.wholesale_price" : ", NULL AS wholesale_price")
+                . " FROM Products p
                 LEFT JOIN Categories c ON c.category_id = p.category_id
                 LEFT JOIN Suppliers s ON s.supplier_id = p.supplier_id
                 LEFT JOIN Inventory i ON i.product_id = p.product_id
@@ -90,8 +114,9 @@ class Product
         $sql = "SELECT TOP {$limit}
                        p.product_id, p.product_code, p.barcode, p.product_name, p.brand,
                        p.image_path, p.cost_price, p.selling_price, p.tax_rate, p.discount_rate, p.unit,
-                       ISNULL(i.quantity_on_hand, 0) AS quantity_on_hand
-                FROM Products p
+                       ISNULL(i.quantity_on_hand, 0) AS quantity_on_hand"
+                . ($this->wholesaleColumnAvailable() ? ", p.wholesale_price" : ", NULL AS wholesale_price")
+                . " FROM Products p
                 LEFT JOIN Inventory i ON i.product_id = p.product_id
                 WHERE p.is_active = 1"
                 . ($term !== '' ? " AND (p.barcode = :exact OR p.product_name LIKE :like_name OR p.product_code LIKE :like_code OR p.brand LIKE :like_brand)" : "")
@@ -165,14 +190,15 @@ class Product
     {
         $this->db->beginTransaction();
         try {
+            $wholesaleAvailable = $this->wholesaleColumnAvailable();
             $sql = "INSERT INTO Products
                         (category_id, supplier_id, product_code, barcode, qr_code, product_name, brand,
-                         image_path, cost_price, selling_price, tax_rate, discount_rate, unit,
+                         image_path, cost_price, selling_price" . ($wholesaleAvailable ? ", wholesale_price" : "") . ", tax_rate, discount_rate, unit,
                          stock_alert_qty, expiration_date, is_active, created_at, updated_at)
                     OUTPUT INSERTED.product_id
                     VALUES
                         (:category_id, :supplier_id, :code, :barcode, :qr, :name, :brand,
-                         :image, :cost, :price, :tax, :discount, :unit,
+                         :image, :cost, :price" . ($wholesaleAvailable ? ", :wholesale_price" : "") . ", :tax, :discount, :unit,
                          :alert_qty, :expiration_date, :is_active, GETDATE(), GETDATE())";
             $stmt = $this->db->prepare($sql);
             $this->bindProduct($stmt, $data);
@@ -198,7 +224,9 @@ class Product
         $sql = "UPDATE Products SET
                     category_id = :category_id, supplier_id = :supplier_id, product_code = :code,
                     barcode = :barcode, qr_code = :qr, product_name = :name, brand = :brand,
-                    image_path = :image, cost_price = :cost, selling_price = :price, tax_rate = :tax,
+                    image_path = :image, cost_price = :cost, selling_price = :price,"
+                . ($this->wholesaleColumnAvailable() ? " wholesale_price = :wholesale_price," : "") . "
+                    tax_rate = :tax,
                     discount_rate = :discount, unit = :unit, stock_alert_qty = :alert_qty, expiration_date = :expiration_date,
                     is_active = :is_active, updated_at = GETDATE()
                 WHERE product_id = :id";
@@ -220,6 +248,10 @@ class Product
         $stmt->bindValue(':image', $data['image_path'] ?: null, $data['image_path'] ? PDO::PARAM_STR : PDO::PARAM_NULL);
         $stmt->bindValue(':cost', $data['cost_price'], PDO::PARAM_STR);
         $stmt->bindValue(':price', $data['selling_price'], PDO::PARAM_STR);
+        if ($this->wholesaleColumnAvailable()) {
+            $wholesale = $data['wholesale_price'] ?? null;
+            $stmt->bindValue(':wholesale_price', $wholesale !== null && $wholesale !== '' ? $wholesale : null, $wholesale !== null && $wholesale !== '' ? PDO::PARAM_STR : PDO::PARAM_NULL);
+        }
         $stmt->bindValue(':tax', $data['tax_rate'], PDO::PARAM_STR);
         $stmt->bindValue(':discount', $data['discount_rate'], PDO::PARAM_STR);
         $stmt->bindValue(':unit', $data['unit'], PDO::PARAM_STR);

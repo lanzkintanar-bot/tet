@@ -193,6 +193,7 @@ class ProductController
             'brand'           => Security::sanitize(trim($_POST['brand'] ?? '')),
             'cost_price'      => (float) ($_POST['cost_price'] ?? 0),
             'selling_price'   => (float) ($_POST['selling_price'] ?? 0),
+            'wholesale_price' => trim((string) ($_POST['wholesale_price'] ?? '')) === '' ? null : (float) $_POST['wholesale_price'],
             'tax_rate'        => (float) ($_POST['tax_rate'] ?? 0),
             'discount_rate'   => (float) ($_POST['discount_rate'] ?? 0),
             'unit'            => Security::sanitize(trim($_POST['unit'] ?? 'pc')) ?: 'pc',
@@ -215,6 +216,9 @@ class ProductController
         }
         if ($data['cost_price'] < 0 || $data['selling_price'] < 0) {
             return [$data, 'Prices cannot be negative.'];
+        }
+        if ($data['wholesale_price'] !== null && $data['wholesale_price'] < 0) {
+            return [$data, 'Wholesale price cannot be negative.'];
         }
         if ($data['tax_rate'] < 0 || $data['tax_rate'] > 100 || $data['discount_rate'] < 0 || $data['discount_rate'] > 100) {
             return [$data, 'Tax and discount rates must be between 0 and 100.'];

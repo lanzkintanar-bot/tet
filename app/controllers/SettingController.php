@@ -102,6 +102,7 @@ class SettingController
             'email_smtp_host' => $smtpHost,
             'email_smtp_port' => (string) $smtpPort,
             'email_smtp_username' => $smtpUsername,
+            'wholesale_pricing_enabled' => !empty($_POST['wholesale_pricing_enabled']) ? '1' : '0',
         ];
         $smtpPassword = trim($_POST['email_smtp_password'] ?? '');
         if ($smtpPassword !== '') $values['email_smtp_password'] = $smtpPassword;

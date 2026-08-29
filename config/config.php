@@ -33,7 +33,7 @@ if (!defined('POS_APP')) {
 // -------------------------------------------------------------------
 // Set to 'development' while building, 'production' when you deploy.
 // In production, error_reporting is silenced and errors are only logged.
-define('APP_ENV', 'production');
+define('APP_ENV', 'development');
 
 if (APP_ENV === 'development') {
     error_reporting(E_ALL);
@@ -135,6 +135,11 @@ define('UPLOAD_PATH', BASE_PATH . '/assets/uploads/products/');
 define('UPLOAD_URL', ASSETS_URL . '/uploads/products/');
 define('MAX_UPLOAD_SIZE', 2 * 1024 * 1024); // 2MB
 define('ALLOWED_IMAGE_TYPES', ['image/jpeg', 'image/png', 'image/webp']);
+
+define('CHAT_UPLOAD_PATH', BASE_PATH . '/assets/uploads/chat/');
+define('CHAT_UPLOAD_URL', ASSETS_URL . '/uploads/chat/');
+define('MAX_CHAT_UPLOAD_SIZE', 8 * 1024 * 1024); // 8MB
+define('ALLOWED_CHAT_FILE_TYPES', ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf']);
 
 // -------------------------------------------------------------------
 // Autoload core classes (simple PSR-4-ish autoloader for Phase 1)

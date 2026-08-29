@@ -17,7 +17,7 @@ if (!defined('POS_APP')) {
 
 class InventoryMovement
 {
-    public const TYPES = ['purchase', 'purchase_cancel', 'sale', 'sale_void', 'adjustment'];
+    public const TYPES = ['purchase', 'purchase_cancel', 'sale', 'sale_void', 'sale_refund', 'adjustment'];
 
     public static function log(
         int $productId,

@@ -13,7 +13,8 @@
 
     const ENDPOINT = (window.APP_URL || '') + '/app/controllers/PosController.php';
 
-    let cart = [];               // [{ product_id, product_name, unit_price, tax_rate, discount_rate, unit, quantity, quantity_on_hand }]
+    let cart = [];               // [{ line_id, product_id, product_name, unit_price, tax_rate, discount_rate, unit, quantity, quantity_on_hand, price_tier, image_url }]
+    let cartLineSeq = 0;          // next line_id - product_id alone stopped being a unique cart-row key once the same product can appear twice (Retail + Wholesale)
     let selectedCustomer = null; // { customer_id, full_name, loyalty_points } or null = walk-in
     let lastSaleId = null;
     let searchDebounce = null;
@@ -26,6 +27,9 @@
     let seniorPwdEnabled = false;
     let seniorPwdDiscountRate = 20;
     let taxInclusive = false;
+    let canOverridePrice = false; // whether THIS session can edit price/discount without a manager approval popup
+    let wholesalePricingEnabled = false; // store-wide Settings toggle - Retail/Wholesale switch only shows on tiles when this is on
+    let additionalDiscountUnlocked = false; // whether the Payment modal's Additional discount widget has been approved for THIS checkout attempt
     let itemToastTimer = null;
     let draftKey = '';
     let draftReady = false;
@@ -53,13 +57,16 @@
         return Math.round(value + (value >= 0 ? 1e-9 : -1e-9));
     }
 
-    function notifyItemAdded(product) {
+    function showToast(message) {
         const $toast = $('#posItemToast');
-        $('#posItemToastText').text(product.product_name + ' added to cart');
+        $('#posItemToastText').text(message);
         $toast.addClass('show');
         clearTimeout(itemToastTimer);
         itemToastTimer = setTimeout(function () { $toast.removeClass('show'); }, 2200);
+    }
 
+    function notifyItemAdded(product) {
+        showToast(product.product_name + ' added to cart');
     }
 
     function focusScanInput() {
@@ -166,6 +173,8 @@
                 seniorPwdDiscountRate = res.loyalty && res.loyalty.pwd_senior_discount_rate !== '' && res.loyalty.pwd_senior_discount_rate != null
                     ? Number(res.loyalty.pwd_senior_discount_rate) : 20;
                 taxInclusive = !!(res.loyalty && res.loyalty.tax_inclusive === '1');
+                canOverridePrice = !!res.can_override_price;
+                wholesalePricingEnabled = !!res.wholesale_pricing_enabled;
                 $('#posSeniorPwdSection').toggleClass('d-none', !seniorPwdEnabled);
                 draftKey = 'pos_store_active_draft_user_' + Number(res.current_user_id || 0);
                 restoreDraft();
@@ -237,9 +246,32 @@
                 .text(outOfStock ? 'Out of stock' : p.quantity_on_hand + ' ' + p.unit + ' left')
                 .toggleClass('text-danger', outOfStock);
 
-            const $btn = $col.find('.pos-product-tile');
+            if (p.image_url) {
+                $col.find('.pos-product-image').attr('src', p.image_url).removeClass('d-none');
+                $col.find('.pos-product-image-placeholder').addClass('d-none');
+            }
+
+            // Retail/Wholesale ("Add As") toggle - only for products that
+            // actually have a wholesale price AND the store-wide Settings
+            // switch is on. Each tile tracks its own selected tier via a
+            // data attribute; tapping the tile itself (not the toggle)
+            // adds at whichever tier is currently active on THAT tile.
+            const hasWholesale = wholesalePricingEnabled && p.wholesale_price != null && Number(p.wholesale_price) > 0;
+            let selectedTier = 'retail';
+            if (hasWholesale) {
+                const $toggle = $col.find('.pos-product-tier-toggle').removeClass('d-none');
+                $toggle.find('.pos-product-tier-btn').on('click', function (e) {
+                    e.stopPropagation();
+                    selectedTier = $(this).data('tier') === 'wholesale' ? 'wholesale' : 'retail';
+                    $toggle.find('.pos-product-tier-btn').removeClass('active');
+                    $(this).addClass('active');
+                    $col.find('.pos-product-price').text(money(selectedTier === 'wholesale' ? p.wholesale_price : p.selling_price));
+                });
+            }
+
+            const $btn = $col.find('.pos-product-tile-main');
             $btn.prop('disabled', outOfStock);
-            $btn.on('click', function () { addToCart(p); });
+            $btn.on('click', function () { addToCart(p, selectedTier); });
 
             $grid.append($col);
         });
@@ -249,8 +281,17 @@
     // Cart
     // -----------------------------------------------------------------
 
-    function addToCart(product) {
-        const existing = cart.find(function (i) { return Number(i.product_id) === Number(product.product_id); });
+    function addToCart(product, tier) {
+        const useWholesale = tier === 'wholesale' && wholesalePricingEnabled
+            && product.wholesale_price != null && Number(product.wholesale_price) > 0;
+        const priceTier = useWholesale ? 'wholesale' : 'retail';
+        const unitPrice = useWholesale ? Number(product.wholesale_price) : Number(product.selling_price);
+
+        // Retail and Wholesale of the same product are kept as separate cart
+        // lines (different price, so they can't just be merged quantities)
+        // - matched here by product_id AND tier, addressed everywhere else
+        // by their own line_id since product_id alone is no longer unique.
+        const existing = cart.find(function (i) { return Number(i.product_id) === Number(product.product_id) && i.price_tier === priceTier; });
         const stock = Number(product.quantity_on_hand);
 
         if (existing) {
@@ -261,29 +302,32 @@
             existing.quantity += 1;
         } else {
             cart.push({
+                line_id: ++cartLineSeq,
                 product_id: product.product_id,
                 product_name: product.product_name,
-                unit_price: Number(product.selling_price),
-                catalog_price: Number(product.selling_price),
+                unit_price: unitPrice,
+                catalog_price: unitPrice,
                 tax_rate: Number(product.tax_rate),
                 discount_rate: Number(product.discount_rate),
                 discount: 0,
                 unit: product.unit,
                 quantity: 1,
                 quantity_on_hand: stock,
+                price_tier: priceTier,
+                image_url: product.image_url || null,
             });
         }
         renderCart();
         notifyItemAdded(product);
     }
 
-    function changeQty(productId, delta) {
-        const item = cart.find(function (i) { return Number(i.product_id) === Number(productId); });
+    function changeQty(lineId, delta) {
+        const item = cart.find(function (i) { return Number(i.line_id) === Number(lineId); });
         if (!item) return;
 
         const newQty = item.quantity + delta;
         if (newQty <= 0) {
-            cart = cart.filter(function (i) { return Number(i.product_id) !== Number(productId); });
+            cart = cart.filter(function (i) { return Number(i.line_id) !== Number(lineId); });
         } else if (newQty > Math.min(item.quantity_on_hand, 10000)) {
             alert('Only ' + item.quantity_on_hand + ' ' + item.unit + ' left in stock.');
             return;
@@ -293,8 +337,8 @@
         renderCart();
     }
 
-    function removeFromCart(productId) {
-        cart = cart.filter(function (i) { return Number(i.product_id) !== Number(productId); });
+    function removeFromCart(lineId) {
+        cart = cart.filter(function (i) { return Number(i.line_id) !== Number(lineId); });
         renderCart();
     }
 
@@ -305,13 +349,17 @@
         $('#posAdditionalDiscountValue').val(value === '' || value == null ? '' : value);
     }
 
-    /** Shows the compact "5% off / Remove" summary once a value is set, otherwise the editable preset/value form. Mirrors the Senior/PWD widget's applied-state pattern below. */
+    /** Shows the compact "5% off / Remove" summary once a value is set, otherwise the editable preset/value form - or, for a Cashier/Staff session that hasn't been approved yet this checkout, a locked banner instead of either. Mirrors the Senior/PWD widget's applied-state pattern below. */
     function updateAdditionalDiscountAppliedView() {
         const mode = $('#posDiscountModePeso').hasClass('active') ? 'peso' : 'percent';
         const rawValue = Math.max(0, Number($('#posAdditionalDiscountValue').val()) || 0);
         const applied = rawValue > 0;
+        const locked = !canOverridePrice && !additionalDiscountUnlocked;
+
+        $('#posAdditionalDiscountLocked').toggleClass('d-none', !locked);
         $('#posAdditionalDiscountApplied').toggleClass('d-none', !applied);
-        $('#posAdditionalDiscountForm').toggleClass('d-none', applied);
+        $('#posAdditionalDiscountForm').toggleClass('d-none', locked || applied);
+        $('#btnRemoveAdditionalDiscount').toggleClass('d-none', locked);
         if (applied) {
             $('#posAdditionalDiscountAppliedText').text(mode === 'peso' ? money(rawValue) + ' off' : rawValue + '% off');
         }
@@ -483,16 +531,21 @@
                 const bargained = item.unit_price < item.catalog_price;
 
                 $body.append(`
-                    <tr data-id="${item.product_id}" class="pos-v2-cart-item" tabindex="-1">
+                    <tr data-id="${item.line_id}" class="pos-v2-cart-item" tabindex="-1">
                         <td>
-                            <div class="fw-medium">${escapeHtml(item.product_name)}${bargained ? ' <span class="badge pos-badge-soft pos-bargain-badge" title="Price negotiated below catalog price">Bargained</span>' : ''}</div>
-                            <div class="pos-cart-price-row">
-                                <button type="button" class="pos-cart-chip pos-cart-chip-price" data-action="edit-price" title="Edit price">
-                                    <span>${money(item.unit_price)}/${escapeHtml(item.unit)}</span><i class="bi bi-pencil-fill"></i>
-                                </button>
-                                <button type="button" class="pos-cart-chip pos-cart-chip-discount${manualDiscount > 0 ? ' pos-cart-chip-active' : ''}" data-action="edit-discount" title="${manualDiscount > 0 ? 'Edit discount' : 'Add discount'}">
-                                    <i class="bi bi-tag-fill"></i><span>${manualDiscount > 0 ? 'Discount ' + money(manualDiscount) : 'Discount'}</span>
-                                </button>
+                            <div class="pos-cart-item-row">
+                                <div class="pos-cart-thumb">${item.image_url ? `<img src="${escapeHtml(item.image_url)}" alt="">` : '<i class="bi bi-box-seam"></i>'}</div>
+                                <div class="pos-cart-item-info">
+                                    <div class="fw-medium">${escapeHtml(item.product_name)}${bargained ? ' <span class="badge pos-badge-soft pos-bargain-badge" title="Price negotiated below catalog price">Bargained</span>' : ''}${item.price_tier === 'wholesale' ? ' <span class="badge pos-badge-soft pos-wholesale-badge" title="Wholesale price">Wholesale</span>' : ''}</div>
+                                    <div class="pos-cart-price-row">
+                                        <button type="button" class="pos-cart-chip pos-cart-chip-price" data-action="edit-price" title="Edit price">
+                                            <span>${money(item.unit_price)}/${escapeHtml(item.unit)}</span><i class="bi bi-pencil-fill"></i>
+                                        </button>
+                                        <button type="button" class="pos-cart-chip pos-cart-chip-discount${manualDiscount > 0 ? ' pos-cart-chip-active' : ''}" data-action="edit-discount" title="${manualDiscount > 0 ? 'Edit discount' : 'Add discount'}">
+                                            <i class="bi bi-tag-fill"></i><span>${manualDiscount > 0 ? 'Discount ' + money(manualDiscount) : 'Discount'}</span>
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
                         </td>
                         <td class="pos-cart-qty-cell">
@@ -525,23 +578,132 @@
         saveDraft();
     }
 
+    // -----------------------------------------------------------------
+    // Manager approval for price overrides / discounts
+    // -----------------------------------------------------------------
+    // A Cashier/Staff session (canOverridePrice === false) can't edit an
+    // item's price or add a discount on their own - a manager/admin has
+    // to clear a popup first, either by password or by scanning their
+    // personal QR badge (Profile page). This never touches the current
+    // login session; it's a one-time "someone with permission approved
+    // this specific action" check, logged server-side either way.
+    let pendingOverrideCallback = null;
+    let pendingOverrideParentModalId = null; // which modal (if any) we hid to show the popup, to reshow once it closes
+    let overrideApprovedThisRound = false;
+    let overrideQrCode = null;
+    let overrideCameraRunning = false;
+
+    function requireOverrideApproval(reason, onApproved) {
+        if (canOverridePrice) {
+            onApproved();
+            return;
+        }
+        pendingOverrideCallback = onApproved;
+        $('#posOverrideReason').text(reason);
+        $('#posOverrideError').addClass('d-none').text('');
+        $('#posOverrideUsername').val('');
+        $('#posOverridePassword').val('');
+        bootstrap.Tab.getOrCreateInstance(document.getElementById('posOverridePasswordTabBtn')).show();
+
+        // Bootstrap doesn't support two modals shown at the same time -
+        // their focus traps fight each other (the password/QR fields
+        // become untypable) and the backdrop bookkeeping breaks (the
+        // page can end up stuck behind an invisible backdrop after
+        // closing). If a modal is already open - e.g. Payment, for the
+        // Additional discount button - hide it first and only open this
+        // popup once that's fully finished closing.
+        const openParent = document.querySelector('#editPriceModal.show, #editDiscountModal.show, #paymentModal.show');
+        pendingOverrideParentModalId = openParent ? openParent.id : null;
+
+        if (openParent) {
+            openParent.addEventListener('hidden.bs.modal', function onParentHidden() {
+                openParent.removeEventListener('hidden.bs.modal', onParentHidden);
+                bootstrap.Modal.getOrCreateInstance(document.getElementById('posOverrideModal')).show();
+            }, { once: true });
+            bootstrap.Modal.getOrCreateInstance(openParent).hide();
+        } else {
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('posOverrideModal')).show();
+        }
+    }
+
+    function stopOverrideCamera() {
+        if (!overrideCameraRunning || !overrideQrCode) return;
+        overrideCameraRunning = false;
+        overrideQrCode.stop().catch(function () { /* already stopped - fine */ });
+    }
+
+    function startOverrideCamera() {
+        if (typeof Html5Qrcode === 'undefined') {
+            $('#posOverrideQrError').removeClass('d-none').text('The camera scanner library could not be loaded. Use the password tab instead.');
+            return;
+        }
+        $('#posOverrideQrError').addClass('d-none');
+        if (!overrideQrCode) overrideQrCode = new Html5Qrcode('posOverrideCameraView');
+
+        overrideQrCode.start(
+            { facingMode: 'environment' },
+            { fps: 10, qrbox: { width: 220, height: 220 } },
+            function onScanSuccess(decodedText) {
+                if (!overrideCameraRunning) return; // ignore stray callbacks after we've already stopped
+                stopOverrideCamera();
+                submitOverrideApproval('qr', { qr_code: decodedText });
+            },
+            function onScanFailure() { /* fired continuously while nothing is in frame - not an error */ }
+        ).then(function () {
+            overrideCameraRunning = true;
+        }).catch(function (error) {
+            overrideCameraRunning = false;
+            $('#posOverrideQrError').removeClass('d-none').text('Could not access the camera. Grant camera permission, or use the password tab instead. (' + error + ')');
+        });
+    }
+
+    /** Approval succeeded or failed for the current attempt - either way, request the popup close (or stays open on failure) via submitOverrideApproval below; #posOverrideModal's own 'hidden.bs.modal' handler (wired in the init block) does the actual parent-reshow + callback sequencing so it happens exactly once, from one place, regardless of how the popup closed. */
+    function submitOverrideApproval(mode, extra) {
+        const $btn = $('#btnPosOverrideApprove');
+        $btn.prop('disabled', true);
+        $('#posOverrideError').addClass('d-none').text('');
+
+        const data = Object.assign({ action: 'authorize_override', mode: mode, reason: $('#posOverrideReason').text() }, extra || {});
+        $.ajax({ url: ENDPOINT, method: 'POST', dataType: 'json', data: data })
+            .done(function (res) {
+                if (res.success) {
+                    stopOverrideCamera();
+                    overrideApprovedThisRound = true;
+                    showToast('Approved by ' + res.approver_name);
+                    bootstrap.Modal.getOrCreateInstance(document.getElementById('posOverrideModal')).hide();
+                } else {
+                    $('#posOverrideError').removeClass('d-none').text(res.message || 'Could not approve this action.');
+                    if (mode === 'qr') startOverrideCamera(); // keep scanning after a bad badge
+                }
+            })
+            .fail(function (jq) {
+                $('#posOverrideError').removeClass('d-none').text((jq.responseJSON && jq.responseJSON.message) || 'Could not approve this action.');
+                if (mode === 'qr') startOverrideCamera();
+            })
+            .always(function () {
+                $btn.prop('disabled', false);
+            });
+    }
+
     /** "Edit Price" modal - item name, old price, and a new price capped at catalog price (a bargain can only go down). */
-    function openEditPriceModal(productId) {
-        const item = cart.find(function (i) { return Number(i.product_id) === productId; });
+    function openEditPriceModal(lineId) {
+        const item = cart.find(function (i) { return Number(i.line_id) === lineId; });
         if (!item) return;
 
-        $('#editPriceItemName').text(item.product_name);
-        $('#editPriceOld').text(money(item.unit_price) + ' / ' + item.unit);
-        $('#editPriceCeiling').text(money(item.catalog_price));
-        $('#editPriceNew').val(item.unit_price).attr('max', item.catalog_price).data('product-id', productId);
-        $('#editPriceError').addClass('d-none');
+        requireOverrideApproval('Edit price - ' + item.product_name, function () {
+            $('#editPriceItemName').text(item.product_name);
+            $('#editPriceOld').text(money(item.unit_price) + ' / ' + item.unit);
+            $('#editPriceCeiling').text(money(item.catalog_price));
+            $('#editPriceNew').val(item.unit_price).attr('max', item.catalog_price).data('line-id', lineId);
+            $('#editPriceError').addClass('d-none');
 
-        bootstrap.Modal.getOrCreateInstance(document.getElementById('editPriceModal')).show();
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('editPriceModal')).show();
+        });
     }
 
     function applyEditPrice() {
-        const productId = Number($('#editPriceNew').data('product-id'));
-        const item = cart.find(function (i) { return Number(i.product_id) === productId; });
+        const lineId = Number($('#editPriceNew').data('line-id'));
+        const item = cart.find(function (i) { return Number(i.line_id) === lineId; });
         if (!item) return;
 
         let value = Number($('#editPriceNew').val());
@@ -565,29 +727,31 @@
     }
 
     /** "Add discount" modal - item name, original price, a %/₱ discount, and a live-computed new price. */
-    function openEditDiscountModal(productId) {
-        const item = cart.find(function (i) { return Number(i.product_id) === productId; });
+    function openEditDiscountModal(lineId) {
+        const item = cart.find(function (i) { return Number(i.line_id) === lineId; });
         if (!item) return;
 
-        $('#editDiscountItemName').text(item.product_name);
-        $('#editDiscountOriginal').text(money(item.unit_price) + ' / ' + item.unit);
-        $('#editDiscountNew').data('product-id', productId);
-        $('#editDiscountError').addClass('d-none');
+        requireOverrideApproval('Add discount - ' + item.product_name, function () {
+            $('#editDiscountItemName').text(item.product_name);
+            $('#editDiscountOriginal').text(money(item.unit_price) + ' / ' + item.unit);
+            $('#editDiscountNew').data('line-id', lineId);
+            $('#editDiscountError').addClass('d-none');
 
-        // The existing per-item discount is stored as a total line amount;
-        // show it back as a per-unit ₱ value so "Original Price -
-        // Discount = New Price" reads naturally for a single unit.
-        const perUnitDiscount = item.quantity > 0 ? (Number(item.discount) || 0) / item.quantity : 0;
-        $('input[name="editDiscountType"][value="peso"]').prop('checked', true);
-        $('#editDiscountValue').val(perUnitDiscount > 0 ? perUnitDiscount.toFixed(2) : '');
-        updateEditDiscountPreview();
+            // The existing per-item discount is stored as a total line amount;
+            // show it back as a per-unit ₱ value so "Original Price -
+            // Discount = New Price" reads naturally for a single unit.
+            const perUnitDiscount = item.quantity > 0 ? (Number(item.discount) || 0) / item.quantity : 0;
+            $('input[name="editDiscountType"][value="peso"]').prop('checked', true);
+            $('#editDiscountValue').val(perUnitDiscount > 0 ? perUnitDiscount.toFixed(2) : '');
+            updateEditDiscountPreview();
 
-        bootstrap.Modal.getOrCreateInstance(document.getElementById('editDiscountModal')).show();
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('editDiscountModal')).show();
+        });
     }
 
     function updateEditDiscountPreview() {
-        const productId = Number($('#editDiscountNew').data('product-id'));
-        const item = cart.find(function (i) { return Number(i.product_id) === productId; });
+        const lineId = Number($('#editDiscountNew').data('line-id'));
+        const item = cart.find(function (i) { return Number(i.line_id) === lineId; });
         if (!item) return;
 
         const type = $('input[name="editDiscountType"]:checked').val();
@@ -608,8 +772,8 @@
     }
 
     function applyEditDiscount() {
-        const productId = Number($('#editDiscountNew').data('product-id'));
-        const item = cart.find(function (i) { return Number(i.product_id) === productId; });
+        const lineId = Number($('#editDiscountNew').data('line-id'));
+        const item = cart.find(function (i) { return Number(i.line_id) === lineId; });
         if (!item) return;
 
         const type = $('input[name="editDiscountType"]:checked').val();
@@ -665,7 +829,9 @@
             localStorage.removeItem(draftKey);
             return;
         }
-        cart = draft.cart.filter(function (item) { return Number(item.product_id) > 0 && Number(item.quantity) > 0; });
+        cart = draft.cart.filter(function (item) { return Number(item.product_id) > 0 && Number(item.quantity) > 0; })
+            .map(function (item) { if (!item.line_id) item.line_id = ++cartLineSeq; return item; });
+        cartLineSeq = cart.reduce(function (max, item) { return Math.max(max, Number(item.line_id) || 0); }, cartLineSeq);
         selectedCustomer = draft.customer && Number(draft.customer.customer_id) > 0 ? draft.customer : null;
         setAdditionalDiscount(draft.discountMode || 'percent', draft.discountValue || '');
         $('#posPointsToRedeem').val(draft.pointsToRedeem || '');
@@ -968,9 +1134,12 @@
                 res.held.forEach(function (sale) {
                     $list.append(`
                         <div class="list-group-item d-flex justify-content-between align-items-center">
-                            <div>
-                                <div class="fw-medium">${escapeHtml(sale.invoice_no)}</div>
-                                <div class="text-muted small">${sale.item_count} item(s) · ${escapeHtml(sale.customer_name || 'Walk-in')} · ${money(sale.grand_total)}</div>
+                            <div class="pos-cart-item-row">
+                                <div class="pos-cart-thumb">${sale.thumbnail_url ? `<img src="${escapeHtml(sale.thumbnail_url)}" alt="">` : '<i class="bi bi-bag"></i>'}</div>
+                                <div class="pos-cart-item-info">
+                                    <div class="fw-medium">${escapeHtml(sale.invoice_no)}</div>
+                                    <div class="text-muted small">${sale.item_count} item(s) · ${escapeHtml(sale.customer_name || 'Walk-in')} · ${money(sale.grand_total)}</div>
+                                </div>
                             </div>
                             <div class="d-flex gap-2">
                                 <button class="btn btn-sm pos-btn-primary btn-resume-held" data-id="${sale.sale_id}">Resume</button>
@@ -1003,7 +1172,15 @@
                 const lineSubtotal = unitPrice * item.quantity;
                 const autoDiscount = Math.round(lineSubtotal * (discountRate / 100) * 100) / 100;
                 const manualDiscount = Math.max(0, Math.round((Number(item.held_discount || 0) - autoDiscount) * 100) / 100);
+                const wholesalePrice = item.wholesale_price != null ? Number(item.wholesale_price) : null;
+                // SaleDetails doesn't store which tier was used (the actual
+                // charged price is what matters financially, and that's
+                // already restored correctly above) - infer the badge by
+                // matching the held price back to this product's wholesale
+                // price, so it reappears unless it was bargained further.
+                const inferredTier = (wholesalePrice && Math.abs(unitPrice - wholesalePrice) < 0.005) ? 'wholesale' : 'retail';
                 return {
+                    line_id: ++cartLineSeq,
                     product_id: item.product_id,
                     product_name: item.product_name,
                     unit_price: unitPrice,
@@ -1012,6 +1189,8 @@
                     unit: item.unit,
                     quantity: item.quantity,
                     quantity_on_hand: Number(item.quantity_on_hand),
+                    price_tier: inferredTier,
+                    image_url: item.image_url || null,
                 };
             });
 
@@ -1118,7 +1297,7 @@
             removeFromCart(Number($(this).closest('tr').data('id')));
         });
         $(document).on('change', '#posCartBody .cart-qty-input', function () {
-            const item = cart.find(i => Number(i.product_id) === Number($(this).closest('tr').data('id')));
+            const item = cart.find(i => Number(i.line_id) === Number($(this).closest('tr').data('id')));
             const value = Math.floor(Number($(this).val()));
             if (!item || !Number.isFinite(value) || value < 1 || value > Math.min(item.quantity_on_hand, 10000)) { renderCart(); return; }
             item.quantity = value; renderCart();
@@ -1139,6 +1318,44 @@
         $('#editDiscountValue').on('input', updateEditDiscountPreview);
         $('input[name="editDiscountType"]').on('change', updateEditDiscountPreview);
 
+        // Manager approval popup (price override / discount)
+        $('#btnPosOverrideApprove').on('click', function () {
+            submitOverrideApproval('password', { username: $('#posOverrideUsername').val(), password: $('#posOverridePassword').val() });
+        });
+        $('#posOverridePassword').on('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); $('#btnPosOverrideApprove').click(); } });
+        $('#posOverrideQrTabBtn').on('shown.bs.tab', function () { startOverrideCamera(); });
+        $('#posOverrideQrTabBtn').on('hide.bs.tab', function () { stopOverrideCamera(); });
+        $('#posOverridePasswordTabBtn').on('shown.bs.tab', function () { stopOverrideCamera(); });
+        $('#posOverrideModal').on('shown.bs.modal', function () {
+            if ($('#posOverridePasswordTabBtn').hasClass('active')) {
+                $('#posOverrideUsername').trigger('focus');
+            }
+        });
+        $('#posOverrideModal').on('hidden.bs.modal', function () {
+            stopOverrideCamera();
+            const callback = pendingOverrideCallback;
+            pendingOverrideCallback = null;
+            const parentId = pendingOverrideParentModalId;
+            pendingOverrideParentModalId = null;
+            const approved = overrideApprovedThisRound;
+            overrideApprovedThisRound = false;
+
+            const runCallback = function () {
+                if (approved && callback) callback();
+            };
+
+            if (parentId) {
+                const parentEl = document.getElementById(parentId);
+                parentEl.addEventListener('shown.bs.modal', function onParentShown() {
+                    parentEl.removeEventListener('shown.bs.modal', onParentShown);
+                    runCallback();
+                }, { once: true });
+                bootstrap.Modal.getOrCreateInstance(parentEl).show();
+            } else {
+                runCallback();
+            }
+        });
+
         $('#posPointsToRedeem').on('input', renderCart);
         $('#posAdditionalDiscountValue').on('input', function () { $('.pos-discount-preset').removeClass('active'); renderCart(); });
         $('.pos-discount-preset').on('click', function () {
@@ -1158,6 +1375,12 @@
             renderCart();
             updateAdditionalDiscountAppliedView();
             saveDraft();
+        });
+        $('#btnUnlockAdditionalDiscount').on('click', function () {
+            requireOverrideApproval('Additional discount at checkout', function () {
+                additionalDiscountUnlocked = true;
+                updateAdditionalDiscountAppliedView();
+            });
         });
         $('#btnApplyAdditionalDiscount').on('click', function () {
             renderCart();
@@ -1286,6 +1509,7 @@
                 return;
             }
             renderPaymentTotals(computeTotals());
+            additionalDiscountUnlocked = false;
             updateAdditionalDiscountAppliedView();
             updateSeniorPwdAppliedView();
             renderPaymentRows();
@@ -1310,6 +1534,87 @@
 
         $('#btnOpenScanner').on('click', function () {
             bootstrap.Modal.getOrCreateInstance(document.getElementById('scannerModal')).show();
+        });
+
+        // -------------------------------------------------------------
+        // Keyboard shortcuts
+        // -------------------------------------------------------------
+        // Every shortcut below just triggers the SAME button an actual
+        // click would (so whatever confirms/guards that button already
+        // has - e.g. "cart is empty" - still apply, nothing bypasses
+        // them). Shortcuts that open a window refuse to fire while any
+        // other window is already open, so a shortcut can never stack a
+        // second window on top of one that's already showing - the
+        // exact bug class fixed elsewhere in this file for the
+        // approval popup.
+        $('#btnShowShortcuts').on('click', function () {
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('posShortcutsModal')).show();
+        });
+
+        $(document).on('keydown', function (e) {
+            const key = e.key.toLowerCase();
+            const noModalOpen = !document.querySelector('.modal.show');
+            const paymentModalOpen = document.getElementById('paymentModal').classList.contains('show');
+
+            // Ctrl+S - focus the search/barcode box, hands off the mouse
+            // entirely for the most common action on this screen.
+            if (e.ctrlKey && !e.altKey && key === 's') {
+                e.preventDefault();
+                if (noModalOpen) $('#posScanInput').trigger('focus').trigger('select');
+                return;
+            }
+
+            // Ctrl+/ - this shortcuts reference itself.
+            if (e.ctrlKey && !e.altKey && key === '/') {
+                e.preventDefault();
+                if (noModalOpen) bootstrap.Modal.getOrCreateInstance(document.getElementById('posShortcutsModal')).show();
+                return;
+            }
+
+            // Ctrl+Enter - move the sale forward: open Payment, or if
+            // it's already open, confirm it (same as clicking Save sale).
+            if (e.ctrlKey && !e.altKey && e.key === 'Enter') {
+                e.preventDefault();
+                if (paymentModalOpen) {
+                    $('#btnCheckout').trigger('click');
+                } else if (noModalOpen) {
+                    $('#btnOpenPayment').trigger('click');
+                }
+                return;
+            }
+
+            if (!e.ctrlKey || !e.altKey) return; // everything else is Ctrl+Alt+<letter>
+
+            switch (key) {
+                case 'b':
+                    e.preventDefault();
+                    if (noModalOpen) $('#btnOpenScanner').trigger('click');
+                    break;
+                case 'i':
+                    e.preventDefault();
+                    if (noModalOpen) $('#btnOpenCatalog').trigger('click');
+                    break;
+                case 'h':
+                    e.preventDefault();
+                    if (noModalOpen) $('#btnHoldSale').trigger('click');
+                    break;
+                case 'j':
+                    e.preventDefault();
+                    if (noModalOpen) $('#btnHeldSales').trigger('click');
+                    break;
+                case 'p':
+                    e.preventDefault();
+                    if (noModalOpen) $('#btnOpenPayment').trigger('click');
+                    break;
+                case 'c':
+                    e.preventDefault();
+                    if (noModalOpen) $('#btnClearCart').trigger('click');
+                    break;
+                case 'u':
+                    e.preventDefault();
+                    if (paymentModalOpen) $('#posCustomerSearch').trigger('focus');
+                    break;
+            }
         });
 
     });

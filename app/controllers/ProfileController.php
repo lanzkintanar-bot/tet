@@ -35,6 +35,8 @@ class ProfileController
             case 'get':              $this->get(); break;
             case 'update':           $this->update(); break;
             case 'change_password':  $this->changePassword(); break;
+            case 'generate_qr_badge': $this->generateQrBadge(); break;
+            case 'revoke_qr_badge':   $this->revokeQrBadge(); break;
             default: Helper::jsonResponse(false, 'Unknown action.', [], 400);
         }
     }
@@ -50,7 +52,11 @@ class ProfileController
         if (!$user) {
             Helper::jsonResponse(false, 'Account not found.', [], 404);
         }
-        Helper::jsonResponse(true, '', ['user' => $user]);
+        Helper::jsonResponse(true, '', [
+            'user' => $user,
+            'can_approve_overrides' => SessionManager::hasPermission('pos.override_price'),
+            'qr_badge_issued_at' => $this->userModel->qrBadgeStatus($this->currentUserId()),
+        ]);
     }
 
     private function update(): void
@@ -92,6 +98,46 @@ class ProfileController
 
         $this->userModel->logActivity($userId, 'PASSWORD_CHANGED', 'Changed own password');
         Helper::jsonResponse(true, 'Password changed.');
+    }
+
+    /**
+     * Issues a fresh POS "approval badge" QR for the current user,
+     * replacing any existing one - shown to the user once, right here;
+     * only its hash is ever stored (see database/migration_pos_override.sql).
+     * Requires the current password again, same as changing it, so a
+     * badge can't be silently (re)issued from an unlocked terminal.
+     */
+    private function generateQrBadge(): void
+    {
+        Security::requireValidCsrfFromRequest();
+
+        $userId = $this->currentUserId();
+        $password = (string) ($_POST['current_password'] ?? '');
+        $hash = $this->userModel->getPasswordHash($userId);
+        if (!$hash || !$this->userModel->verifyPassword($password, $hash)) {
+            Helper::jsonResponse(false, 'Your current password is incorrect.', [], 422);
+        }
+
+        $badge = $this->userModel->generateQrBadge($userId);
+        if ($badge === null) {
+            Helper::jsonResponse(false, 'QR badges aren\'t set up on this database yet. Ask an administrator to run database/migration_pos_override.sql.', [], 422);
+        }
+
+        $this->userModel->logActivity($userId, 'QR_BADGE_GENERATED', 'Generated a new POS approval QR badge');
+        Helper::jsonResponse(true, 'Badge generated.', [
+            'badge' => $badge,
+            'issued_at' => date('Y-m-d H:i:s'),
+        ]);
+    }
+
+    private function revokeQrBadge(): void
+    {
+        Security::requireValidCsrfFromRequest();
+
+        $userId = $this->currentUserId();
+        $this->userModel->revokeQrBadge($userId);
+        $this->userModel->logActivity($userId, 'QR_BADGE_REVOKED', 'Revoked their POS approval QR badge');
+        Helper::jsonResponse(true, 'Badge revoked.');
     }
 }
 

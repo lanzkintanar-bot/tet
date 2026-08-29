@@ -70,4 +70,35 @@ if (!defined('POS_APP')) {
             </div>
         </div>
     </div>
+
+    <div class="col-lg-6 d-none" id="qrBadgeCardWrap">
+        <div class="card pos-card border-0 shadow-sm">
+            <div class="card-body">
+                <h2 class="h6 mb-1">POS Approval QR Badge</h2>
+                <p class="text-muted small mb-3">Cashiers scan this at the register to get your approval for a price override or discount. It does not sign you in anywhere and can be revoked any time.</p>
+                <div class="alert alert-success d-none" id="qrBadgeSuccessAlert"></div>
+                <div class="alert alert-danger d-none" id="qrBadgeFormAlert"></div>
+
+                <div id="qrBadgeStatus" class="small text-muted mb-3">No badge issued yet.</div>
+
+                <div id="qrBadgeDisplay" class="text-center mb-3 d-none">
+                    <div class="d-none d-print-block mb-2"><strong id="qrBadgePrintLabel">POS Approval Badge</strong></div>
+                    <div id="qrBadgeCanvas" class="d-inline-block p-3 bg-white rounded border"></div>
+                    <p class="small text-muted mt-2 mb-0">This is shown once - save or print it now. It won't be shown again.</p>
+                    <button class="btn btn-sm btn-outline-secondary mt-2" type="button" id="btnPrintQrBadge"><i class="bi bi-printer me-1"></i>Print badge</button>
+                </div>
+
+                <form id="qrBadgeForm" class="mb-2">
+                    <label class="form-label small text-muted">Confirm your password to (re)generate</label>
+                    <div class="input-group">
+                        <input type="password" class="form-control" id="qrBadgePassword" placeholder="Current password" required autocomplete="off">
+                        <button class="btn pos-btn-primary" type="submit" id="qrBadgeGenerateBtn">
+                            <span class="spinner-border spinner-border-sm d-none me-1"></span>Generate badge
+                        </button>
+                    </div>
+                </form>
+                <button class="btn btn-sm btn-outline-danger d-none" type="button" id="btnRevokeQrBadge">Revoke current badge</button>
+            </div>
+        </div>
+    </div>
 </div>

@@ -66,6 +66,7 @@
         $('input[name="receiptTemplate"][value="' + (settings.receipt_template === 'modern' ? 'modern' : 'classic') + '"]').prop('checked', true);
         $('input[name="printerWidth"][value="' + (settings.printer_width === '58' ? '58' : '80') + '"]').prop('checked', true);
         $('#cashPaymentOnly').prop('checked', settings.cash_payment_only === '1');
+        $('#wholesalePricingEnabled').prop('checked', settings.wholesale_pricing_enabled === '1');
         $('#pwdSeniorDiscountEnabled').prop('checked', settings.pwd_senior_discount_enabled !== '0');
         $('#pwdSeniorDiscountRate').val(settings.pwd_senior_discount_rate === '' || settings.pwd_senior_discount_rate == null ? '20' : settings.pwd_senior_discount_rate);
         $('#mobileFullscreen').prop('checked', settings.mobile_fullscreen === '1');
@@ -101,7 +102,7 @@
             action: 'save', store_name: $('#storeName').val(), store_address: $('#storeAddress').val(), store_phone: $('#storePhone').val(), currency_symbol: $('#currencySymbol').val(), receipt_footer: $('#receiptFooter').val(),
             tax_inclusive: $('#taxInclusive').is(':checked') ? 1 : 0, show_store_on_receipt: $('#showStoreOnReceipt').is(':checked') ? 1 : 0, show_receipt_after_sale: $('#showReceiptAfterSale').is(':checked') ? 1 : 0, auto_print_receipt: $('#autoPrintReceipt').is(':checked') ? 1 : 0,
             receipt_template: $('input[name="receiptTemplate"]:checked').val() || 'classic', printer_width: $('input[name="printerWidth"]:checked').val() || '80',
-            cash_payment_only: $('#cashPaymentOnly').is(':checked') ? 1 : 0, mobile_fullscreen: $('#mobileFullscreen').is(':checked') ? 1 : 0,
+            cash_payment_only: $('#cashPaymentOnly').is(':checked') ? 1 : 0, mobile_fullscreen: $('#mobileFullscreen').is(':checked') ? 1 : 0, wholesale_pricing_enabled: $('#wholesalePricingEnabled').is(':checked') ? 1 : 0,
             pwd_senior_discount_enabled: $('#pwdSeniorDiscountEnabled').is(':checked') ? 1 : 0, pwd_senior_discount_rate: $('#pwdSeniorDiscountRate').val() || '20',
             loyalty_spend_amount: $('#loyaltySpendAmount').val(), loyalty_points_awarded: $('#loyaltyPointsAwarded').val(), loyalty_point_value: $('#loyaltyPointValue').val(), email_password_reset_enabled: $('#emailPasswordResetEnabled').is(':checked') ? 1 : 0,
             email_smtp_host: $('#emailSmtpHost').val(), email_smtp_port: $('#emailSmtpPort').val(), email_smtp_username: $('#emailSmtpUsername').val(), email_smtp_password: $('#emailSmtpPassword').val(),

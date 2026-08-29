@@ -24,12 +24,14 @@ class PosController
     private Sale $saleModel;
     private Category $categoryModel;
     private User $userModel;
+    private Role $roleModel;
 
     public function __construct()
     {
         $this->saleModel     = new Sale();
         $this->categoryModel = new Category();
         $this->userModel     = new User();
+        $this->roleModel     = new Role();
     }
 
     public function dispatch(): void
@@ -47,6 +49,7 @@ class PosController
             case 'held_get':     $this->heldGet(); break;
             case 'held_delete':  $this->heldDelete(); break;
             case 'receipt':      $this->receipt(); break;
+            case 'authorize_override': $this->authorizeOverride(); break;
             default: Helper::jsonResponse(false, 'Unknown action.', [], 400);
         }
     }
@@ -59,6 +62,8 @@ class PosController
             'payment_methods' => ['cash' => 'Cash', 'gcash' => 'GCash', 'maya' => 'Maya', 'card' => 'Card'],
             'loyalty'         => (new Setting())->getAll(),
             'current_user_id' => (int) SessionManager::get('user_id'),
+            'can_override_price' => SessionManager::hasPermission('pos.override_price'),
+            'wholesale_pricing_enabled' => (new Setting())->getAll()['wholesale_pricing_enabled'] === '1',
         ]);
     }
 
@@ -170,6 +175,52 @@ class PosController
         }
         $settings = (new Setting())->getAll();
         Helper::jsonResponse(true, '', ['sale' => $sale, 'settings' => $settings]);
+    }
+
+    /**
+     * Clears the "manager approval required" popup for editing an item's
+     * price or applying a discount. Does NOT touch the current session -
+     * the cashier stays logged in as themselves; this only checks that
+     * SOME account holding 'pos.override_price' is vouching for the
+     * action, right now, either by password or by scanning their
+     * personal QR badge (see database/migration_pos_override.sql).
+     * Every attempt (approved or denied) is written to ActivityLogs.
+     */
+    private function authorizeOverride(): void
+    {
+        Security::requireValidCsrfFromRequest();
+
+        $mode = $_POST['mode'] ?? 'password';
+        $cashierId = (int) SessionManager::get('user_id');
+        $reason = Security::sanitize(trim($_POST['reason'] ?? '')); // e.g. "Edit price" / "Add discount" - for the audit log only
+
+        $approver = null;
+        if ($mode === 'qr') {
+            $code = trim((string) ($_POST['qr_code'] ?? ''));
+            $approver = $code !== '' ? $this->userModel->findByQrBadge($code) : null;
+        } else {
+            $username = Security::sanitize(trim($_POST['username'] ?? ''));
+            $password = (string) ($_POST['password'] ?? '');
+            if ($username !== '' && $password !== '') {
+                $candidate = $this->userModel->findByUsername($username);
+                if ($candidate && $this->userModel->verifyPassword($password, $candidate['password_hash'])) {
+                    $approver = $candidate;
+                }
+            }
+        }
+
+        if (!$approver || !$approver['is_active'] || $this->userModel->isLocked($approver)) {
+            $this->userModel->logActivity($cashierId, 'POS_OVERRIDE_DENIED', "Override request denied ({$mode})" . ($reason !== '' ? " for: {$reason}" : ''));
+            Helper::jsonResponse(false, $mode === 'qr' ? 'That QR badge is not recognized or is no longer active.' : 'Invalid username or password.', [], 401);
+        }
+
+        if (!$this->roleModel->hasPermission((int) $approver['role_id'], 'pos.override_price')) {
+            $this->userModel->logActivity($cashierId, 'POS_OVERRIDE_DENIED', "{$approver['username']} attempted to approve an override but is not authorized.");
+            Helper::jsonResponse(false, 'This account is not authorized to approve overrides.', [], 403);
+        }
+
+        $this->userModel->logActivity($cashierId, 'POS_OVERRIDE_APPROVED', "Approved by {$approver['full_name']} ({$approver['username']}) via {$mode}" . ($reason !== '' ? " for: {$reason}" : ''));
+        Helper::jsonResponse(true, 'Approved.', ['approver_name' => $approver['full_name']]);
     }
 
     // -------------------------------------------------------------

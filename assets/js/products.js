@@ -254,6 +254,7 @@
             $('#productSupplier').val(p.supplier_id || '');
             $('#productCost').val(p.cost_price);
             $('#productPrice').val(p.selling_price);
+            $('#productWholesalePrice').val(p.wholesale_price != null ? p.wholesale_price : '');
             $('#productTax').val(p.tax_rate);
             $('#productDiscount').val(p.discount_rate);
             $('#productUnit').val(p.unit);

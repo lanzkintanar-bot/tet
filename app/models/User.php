@@ -315,6 +315,113 @@ class User
     }
 
     // -------------------------------------------------------------
+    // POS override "approval badge" QR codes (see database/migration_pos_override.sql)
+    // -------------------------------------------------------------
+    // NOT used for signing in - only to clear the manager-approval popup
+    // on the POS Screen when a Cashier/Staff account tries to edit an
+    // item's price or apply a discount. One active badge per user;
+    // generating a new one immediately invalidates the old one.
+
+    private static ?bool $qrTokensTableAvailable = null;
+
+    private function qrTokensAvailable(): bool
+    {
+        if (self::$qrTokensTableAvailable === null) {
+            try {
+                $stmt = $this->db->query("SELECT OBJECT_ID('dbo.UserQrTokens', 'U') AS id");
+                self::$qrTokensTableAvailable = !empty($stmt->fetch()['id']);
+            } catch (\Throwable $e) {
+                self::$qrTokensTableAvailable = false;
+            }
+        }
+        return self::$qrTokensTableAvailable;
+    }
+
+    /** Generates a fresh badge for this user, replacing any existing one. Returns the raw "selector:validator" value to encode into a QR - shown once, never stored raw. */
+    public function generateQrBadge(int $userId): ?string
+    {
+        if (!$this->qrTokensAvailable()) {
+            return null;
+        }
+
+        $selector = bin2hex(random_bytes(9));
+        $validator = bin2hex(random_bytes(33));
+        $validatorHash = hash('sha256', $validator);
+
+        $del = $this->db->prepare("DELETE FROM UserQrTokens WHERE user_id = :id");
+        $del->bindValue(':id', $userId, PDO::PARAM_INT);
+        $del->execute();
+
+        $stmt = $this->db->prepare(
+            "INSERT INTO UserQrTokens (user_id, selector, validator_hash, created_at) VALUES (:user_id, :selector, :hash, GETDATE())"
+        );
+        $stmt->bindValue(':user_id', $userId, PDO::PARAM_INT);
+        $stmt->bindValue(':selector', $selector, PDO::PARAM_STR);
+        $stmt->bindValue(':hash', $validatorHash, PDO::PARAM_STR);
+        $stmt->execute();
+
+        return $selector . ':' . $validator;
+    }
+
+    public function revokeQrBadge(int $userId): void
+    {
+        if (!$this->qrTokensAvailable()) {
+            return;
+        }
+        $stmt = $this->db->prepare("DELETE FROM UserQrTokens WHERE user_id = :id");
+        $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
+        $stmt->execute();
+    }
+
+    /** Whether this user currently has an active badge, and when it was issued - for the Profile page status line. */
+    public function qrBadgeStatus(int $userId): ?string
+    {
+        if (!$this->qrTokensAvailable()) {
+            return null;
+        }
+        $stmt = $this->db->prepare("SELECT created_at FROM UserQrTokens WHERE user_id = :id");
+        $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
+        $stmt->execute();
+        $row = $stmt->fetch();
+        return $row ? $row['created_at'] : null;
+    }
+
+    /** Resolves a scanned "selector:validator" badge to the account it belongs to, in the same shape findByUsername() returns (so callers can reuse is_active/isLocked/branch checks). Null if malformed, unknown, or tampered with. */
+    public function findByQrBadge(string $code): ?array
+    {
+        if (!$this->qrTokensAvailable()) {
+            return null;
+        }
+
+        $parts = explode(':', $code, 2);
+        if (count($parts) !== 2 || $parts[0] === '' || $parts[1] === '') {
+            return null;
+        }
+        [$selector, $validator] = $parts;
+
+        $stmt = $this->db->prepare("SELECT user_id, validator_hash FROM UserQrTokens WHERE selector = :selector");
+        $stmt->bindValue(':selector', $selector, PDO::PARAM_STR);
+        $stmt->execute();
+        $row = $stmt->fetch();
+        if (!$row || !hash_equals($row['validator_hash'], hash('sha256', $validator))) {
+            return null;
+        }
+
+        $sql = "SELECT u.user_id, u.username, u.full_name, u.role_id, u.is_active,
+                       u.failed_attempts, u.locked_until, u.branch_id,
+                       r.role_name, b.is_active AS branch_is_active
+                FROM Users u
+                INNER JOIN Roles r ON r.role_id = u.role_id
+                LEFT JOIN Branches b ON b.branch_id = u.branch_id
+                WHERE u.user_id = :id";
+        $userStmt = $this->db->prepare($sql);
+        $userStmt->bindValue(':id', (int) $row['user_id'], PDO::PARAM_INT);
+        $userStmt->execute();
+        $user = $userStmt->fetch();
+        return $user ?: null;
+    }
+
+    // -------------------------------------------------------------
     // Activity log (general audit trail, used app-wide later)
     // -------------------------------------------------------------
 

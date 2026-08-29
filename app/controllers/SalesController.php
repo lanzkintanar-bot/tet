@@ -35,6 +35,7 @@ class SalesController
             case 'list':  $this->list(); break;
             case 'get':   $this->get(); break;
             case 'void':  $this->void(); break;
+            case 'refund': $this->refund(); break;
             case 'export_excel': $this->export('excel'); break;
             case 'export_pdf':   $this->export('pdf'); break;
             default: Helper::jsonResponse(false, 'Unknown action.', [], 400);
@@ -87,6 +88,29 @@ class SalesController
 
         $this->userModel->logActivity((int) SessionManager::get('user_id'), 'SALE_VOID', "Voided sale #{$id}");
         Helper::jsonResponse(true, 'Sale voided and stock restored.');
+    }
+
+    private function refund(): void
+    {
+        Security::requireValidCsrfFromRequest();
+        SessionManager::requirePermission('sales.refund');
+
+        $id = (int) ($_POST['sale_id'] ?? 0);
+        if ($id <= 0) {
+            Helper::jsonResponse(false, 'Sale not found.', [], 404);
+        }
+
+        $items = json_decode($_POST['items'] ?? '[]', true);
+        $items = is_array($items) ? $items : [];
+        $reason = Security::sanitize(trim($_POST['reason'] ?? ''));
+
+        [$refundId, $error] = $this->saleModel->refund($id, $items, $reason, (int) SessionManager::get('user_id'));
+        if ($error) {
+            Helper::jsonResponse(false, $error, [], 422);
+        }
+
+        $this->userModel->logActivity((int) SessionManager::get('user_id'), 'SALE_REFUND', "Refunded items on sale #{$id} (refund #{$refundId})");
+        Helper::jsonResponse(true, 'Refund processed and stock restored.', ['refund_id' => $refundId]);
     }
 
     private function export(string $format): void

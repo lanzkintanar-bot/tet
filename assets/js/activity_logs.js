@@ -7,7 +7,14 @@
     'use strict';
 
     const ENDPOINT = (window.APP_URL || '') + '/app/controllers/ActivityLogController.php';
-    let state = { search: '', userId: '', dateFrom: '', dateTo: '', page: 1, perPage: 25 };
+
+    /** YYYY-MM-DD for the browser's local "today" - matches what a native date input expects/shows. */
+    function todayIso() {
+        const d = new Date();
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+
+    let state = { search: '', userId: '', dateFrom: todayIso(), dateTo: todayIso(), page: 1, perPage: 25 };
     let searchDebounce = null;
 
     function escapeHtml(str) { return $('<div>').text(str == null ? '' : str).html(); }
@@ -159,6 +166,9 @@
     }
 
     $(function () {
+        $('#logDateFrom').val(state.dateFrom);
+        $('#logDateTo').val(state.dateTo);
+
         loadFormData();
         loadList();
 

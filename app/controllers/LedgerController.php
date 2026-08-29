@@ -26,6 +26,7 @@ class LedgerController
         'purchase_cancel' => 'Purchase Cancelled (Out)',
         'sale'            => 'Sale (Out)',
         'sale_void'       => 'Sale Voided (In)',
+        'sale_refund'     => 'Sale Refunded (In)',
         'adjustment'      => 'Manual Adjustment',
     ];
 

@@ -50,6 +50,45 @@ class Sale
         return $this->columnExists('shift_id');
     }
 
+    /**
+     * Whether database/migration_refunds.sql (or a fresh pos_store.sql,
+     * which now includes it) has been run. Every refund-facing method
+     * below checks this first and degrades to a clear, friendly error
+     * instead of a raw "invalid object name" SQL error on a database
+     * that hasn't applied the migration yet.
+     */
+    private static ?bool $refundsTableAvailable = null;
+
+    private function refundsAvailable(): bool
+    {
+        if (self::$refundsTableAvailable === null) {
+            try {
+                $stmt = $this->db->query("SELECT OBJECT_ID('dbo.Refunds', 'U') AS id");
+                self::$refundsTableAvailable = !empty($stmt->fetch()['id']);
+            } catch (\Throwable $e) {
+                self::$refundsTableAvailable = false;
+            }
+        }
+        return self::$refundsTableAvailable;
+    }
+
+    /** Whether database/migration_wholesale_pricing.sql has been run - see Product.php's identical helper for the full rationale. */
+    private static ?bool $wholesaleColumnAvailable = null;
+
+    private function wholesaleColumnAvailable(): bool
+    {
+        if (self::$wholesaleColumnAvailable === null) {
+            try {
+                $stmt = $this->db->query("SELECT COL_LENGTH('dbo.Products', 'wholesale_price') AS len");
+                $row = $stmt->fetch();
+                self::$wholesaleColumnAvailable = $row && $row['len'] !== null;
+            } catch (\Throwable $e) {
+                self::$wholesaleColumnAvailable = false;
+            }
+        }
+        return self::$wholesaleColumnAvailable;
+    }
+
     private PDO $db;
 
     public function __construct()
@@ -108,8 +147,9 @@ class Sale
         $sql = "SELECT p.product_id, p.product_code, p.barcode, p.product_name, p.brand,
                        p.image_path, p.selling_price, p.tax_rate, p.discount_rate, p.unit,
                        p.category_id, c.category_name,
-                       ISNULL(i.quantity_on_hand, 0) AS quantity_on_hand
-                FROM Products p
+                       ISNULL(i.quantity_on_hand, 0) AS quantity_on_hand"
+                . ($this->wholesaleColumnAvailable() ? ", p.wholesale_price" : ", NULL AS wholesale_price")
+                . " FROM Products p
                 LEFT JOIN Categories c ON c.category_id = p.category_id
                 LEFT JOIN Inventory i ON i.product_id = p.product_id
                 {$where}
@@ -135,8 +175,9 @@ class Sale
         $stmt = $this->db->prepare(
             "SELECT p.product_id, p.product_code, p.barcode, p.product_name, p.brand,
                     p.image_path, p.selling_price, p.tax_rate, p.discount_rate, p.unit, p.is_active,
-                    ISNULL(i.quantity_on_hand, 0) AS quantity_on_hand
-             FROM Products p
+                    ISNULL(i.quantity_on_hand, 0) AS quantity_on_hand"
+            . ($this->wholesaleColumnAvailable() ? ", p.wholesale_price" : ", NULL AS wholesale_price")
+            . " FROM Products p
              LEFT JOIN Inventory i ON i.product_id = p.product_id
              WHERE p.barcode = :barcode"
         );
@@ -631,13 +672,22 @@ class Sale
     {
         $sql = "SELECT s.sale_id, s.invoice_no, s.grand_total, s.created_at,
                        c.full_name AS customer_name, u.full_name AS cashier_name,
-                       (SELECT COUNT(*) FROM SaleDetails sd WHERE sd.sale_id = s.sale_id) AS item_count
+                       (SELECT COUNT(*) FROM SaleDetails sd WHERE sd.sale_id = s.sale_id) AS item_count,
+                       (SELECT TOP 1 p.image_path FROM SaleDetails sd
+                        INNER JOIN Products p ON p.product_id = sd.product_id
+                        WHERE sd.sale_id = s.sale_id AND p.image_path IS NOT NULL
+                        ORDER BY sd.sale_detail_id) AS thumbnail_path
                 FROM Sales s
                 LEFT JOIN Customers c ON c.customer_id = s.customer_id
                 INNER JOIN Users u ON u.user_id = s.user_id
                 WHERE s.status = 'held'
                 ORDER BY s.created_at DESC";
-        return $this->db->query($sql)->fetchAll();
+        $rows = $this->db->query($sql)->fetchAll();
+        foreach ($rows as &$row) {
+            $row['thumbnail_url'] = $row['thumbnail_path'] ? UPLOAD_URL . $row['thumbnail_path'] : null;
+        }
+        unset($row);
+        return $rows;
     }
 
     /**
@@ -662,16 +712,22 @@ class Sale
 
         $itemStmt = $this->db->prepare(
             "SELECT sd.product_id, sd.quantity, sd.unit_price AS held_unit_price, sd.discount_amount AS held_discount,
-                    p.product_name, p.product_code, p.unit,
-                    p.selling_price, p.tax_rate, p.discount_rate, ISNULL(i.quantity_on_hand, 0) AS quantity_on_hand
-             FROM SaleDetails sd
+                    p.product_name, p.product_code, p.unit, p.image_path,
+                    p.selling_price, p.tax_rate, p.discount_rate, ISNULL(i.quantity_on_hand, 0) AS quantity_on_hand"
+            . ($this->wholesaleColumnAvailable() ? ", p.wholesale_price" : ", NULL AS wholesale_price")
+            . " FROM SaleDetails sd
              INNER JOIN Products p ON p.product_id = sd.product_id
              LEFT JOIN Inventory i ON i.product_id = sd.product_id
              WHERE sd.sale_id = :id"
         );
         $itemStmt->bindValue(':id', $saleId, PDO::PARAM_INT);
         $itemStmt->execute();
-        $sale['items'] = $itemStmt->fetchAll();
+        $items = $itemStmt->fetchAll();
+        foreach ($items as &$item) {
+            $item['image_url'] = $item['image_path'] ? UPLOAD_URL . $item['image_path'] : null;
+        }
+        unset($item);
+        $sale['items'] = $items;
 
         return $sale;
     }
@@ -744,10 +800,15 @@ class Sale
         $countStmt->execute($params);
         $total = (int) $countStmt->fetch()['total'];
 
+        $refundedSql = $this->refundsAvailable()
+            ? '(SELECT ISNULL(SUM(r.refund_amount), 0) FROM Refunds r WHERE r.sale_id = s.sale_id)'
+            : '0';
+
         $sql = "SELECT s.sale_id, s.invoice_no, s.grand_total, s.payment_method, s.status, s.created_at,
                        s.branch_id, c.full_name AS customer_name, u.full_name AS cashier_name,
                        b.branch_code, b.branch_name,
-                       (SELECT COUNT(*) FROM SaleDetails sd WHERE sd.sale_id = s.sale_id) AS item_count
+                       (SELECT COUNT(*) FROM SaleDetails sd WHERE sd.sale_id = s.sale_id) AS item_count,
+                       {$refundedSql} AS refunded_amount
                 {$base}
                 ORDER BY s.{$sortBy} {$sortDir}
                 OFFSET :offset ROWS FETCH NEXT :perPage ROWS ONLY";
@@ -835,6 +896,207 @@ class Sale
     }
 
     // -------------------------------------------------------------
+    // Refunds (item-level, partial-or-full - see database/migration_refunds.sql)
+    // -------------------------------------------------------------
+
+    /** Past refunds for a sale, newest first, each with its line items. */
+    public function getRefunds(int $saleId): array
+    {
+        if (!$this->refundsAvailable()) {
+            return [];
+        }
+
+        $stmt = $this->db->prepare(
+            "SELECT r.refund_id, r.reason, r.refund_amount, r.created_at, u.full_name AS user_name
+             FROM Refunds r
+             INNER JOIN Users u ON u.user_id = r.user_id
+             WHERE r.sale_id = :id
+             ORDER BY r.created_at DESC, r.refund_id DESC"
+        );
+        $stmt->bindValue(':id', $saleId, PDO::PARAM_INT);
+        $stmt->execute();
+        $refunds = $stmt->fetchAll();
+        if (!$refunds) {
+            return [];
+        }
+
+        $detailStmt = $this->db->prepare(
+            "SELECT rd.quantity, rd.refund_amount, p.product_name, p.unit
+             FROM RefundDetails rd
+             INNER JOIN Products p ON p.product_id = rd.product_id
+             WHERE rd.refund_id = :refund_id"
+        );
+        foreach ($refunds as &$refund) {
+            $refund['refund_amount'] = (float) $refund['refund_amount'];
+            $detailStmt->bindValue(':refund_id', $refund['refund_id'], PDO::PARAM_INT);
+            $detailStmt->execute();
+            $refund['items'] = $detailStmt->fetchAll();
+        }
+        unset($refund);
+
+        return $refunds;
+    }
+
+    /**
+     * Refunds specific quantities of specific line items on a completed
+     * sale: validates each request against what's actually left to
+     * refund (sold quantity minus whatever prior refunds already took),
+     * records a Refunds/RefundDetails row per line, restores the
+     * refunded quantity to Inventory, and logs an InventoryMovements
+     * row for each - mirroring void()'s stock-restoration pattern, but
+     * scoped to only the lines/quantities actually being returned.
+     *
+     * @param array $items [['sale_detail_id' => int, 'quantity' => int], ...]
+     *   Lines with quantity <= 0 are ignored (lets the UI submit every row
+     *   unconditionally without the caller having to filter first).
+     * @return array [refundId|null, error|null]
+     */
+    public function refund(int $saleId, array $items, string $reason, int $userId): array
+    {
+        if (!$this->refundsAvailable()) {
+            return [null, 'Refunds aren\'t set up on this database yet. Ask an administrator to run database/migration_refunds.sql.'];
+        }
+
+        $reason = trim($reason);
+
+        $this->db->beginTransaction();
+        try {
+            $stmt = $this->db->prepare("SELECT status, invoice_no FROM Sales WHERE sale_id = :id");
+            $stmt->bindValue(':id', $saleId, PDO::PARAM_INT);
+            $stmt->execute();
+            $sale = $stmt->fetch();
+
+            if (!$sale) {
+                $this->db->rollBack();
+                return [null, 'Sale not found.'];
+            }
+            if ($sale['status'] !== 'completed') {
+                $this->db->rollBack();
+                return [null, 'Only completed sales can be refunded.'];
+            }
+
+            // Lock this sale's lines (and their already-refunded totals)
+            // for the duration of the transaction, so two refunds against
+            // the same line submitted at the same moment can't both pass
+            // validation against the same "remaining" quantity.
+            $lineStmt = $this->db->prepare(
+                "SELECT sd.sale_detail_id, sd.product_id, sd.quantity, sd.unit_price, sd.line_total, p.product_name
+                 FROM SaleDetails sd WITH (UPDLOCK, HOLDLOCK)
+                 INNER JOIN Products p ON p.product_id = sd.product_id
+                 WHERE sd.sale_id = :id"
+            );
+            $lineStmt->bindValue(':id', $saleId, PDO::PARAM_INT);
+            $lineStmt->execute();
+            $linesById = [];
+            foreach ($lineStmt->fetchAll() as $line) {
+                $linesById[(int) $line['sale_detail_id']] = $line;
+            }
+            if (!$linesById) {
+                $this->db->rollBack();
+                return [null, 'This sale has no items to refund.'];
+            }
+
+            $refundedStmt = $this->db->prepare(
+                "SELECT ISNULL(SUM(quantity), 0) AS refunded FROM RefundDetails WHERE sale_detail_id = :sale_detail_id"
+            );
+
+            $toApply = [];
+            $refundTotal = 0.0;
+            foreach ($items as $item) {
+                $saleDetailId = (int) ($item['sale_detail_id'] ?? 0);
+                $qty = (int) ($item['quantity'] ?? 0);
+                if ($qty <= 0) {
+                    continue;
+                }
+                if (!isset($linesById[$saleDetailId])) {
+                    $this->db->rollBack();
+                    return [null, 'One of the selected items does not belong to this sale.'];
+                }
+
+                $line = $linesById[$saleDetailId];
+                $refundedStmt->bindValue(':sale_detail_id', $saleDetailId, PDO::PARAM_INT);
+                $refundedStmt->execute();
+                $alreadyRefunded = (int) $refundedStmt->fetch()['refunded'];
+                $remaining = (int) $line['quantity'] - $alreadyRefunded;
+
+                if ($qty > $remaining) {
+                    $this->db->rollBack();
+                    $available = max(0, $remaining);
+                    return [null, "Cannot refund {$qty} x \"{$line['product_name']}\" - only {$available} left to refund."];
+                }
+
+                $perUnit = ((float) $line['line_total']) / max(1, (int) $line['quantity']);
+                $lineRefund = round($perUnit * $qty, 2);
+                $refundTotal += $lineRefund;
+
+                $toApply[] = [
+                    'sale_detail_id' => $saleDetailId,
+                    'product_id'     => (int) $line['product_id'],
+                    'quantity'       => $qty,
+                    'unit_price'     => (float) $line['unit_price'],
+                    'refund_amount'  => $lineRefund,
+                    'product_name'   => $line['product_name'],
+                ];
+            }
+
+            if (!$toApply) {
+                $this->db->rollBack();
+                return [null, 'Select at least one item and quantity to refund.'];
+            }
+
+            $refundTotal = round($refundTotal, 2);
+
+            $insertRefund = $this->db->prepare(
+                "INSERT INTO Refunds (sale_id, invoice_no, user_id, reason, refund_amount, created_at)
+                 OUTPUT INSERTED.refund_id
+                 VALUES (:sale_id, :invoice_no, :user_id, :reason, :refund_amount, GETDATE())"
+            );
+            $insertRefund->bindValue(':sale_id', $saleId, PDO::PARAM_INT);
+            $insertRefund->bindValue(':invoice_no', $sale['invoice_no'], PDO::PARAM_STR);
+            $insertRefund->bindValue(':user_id', $userId, PDO::PARAM_INT);
+            $insertRefund->bindValue(':reason', $reason !== '' ? $reason : null, $reason !== '' ? PDO::PARAM_STR : PDO::PARAM_NULL);
+            $insertRefund->bindValue(':refund_amount', $refundTotal);
+            $insertRefund->execute();
+            $refundId = (int) $insertRefund->fetch()['refund_id'];
+
+            $insertDetail = $this->db->prepare(
+                "INSERT INTO RefundDetails (refund_id, sale_detail_id, product_id, quantity, unit_price, refund_amount)
+                 VALUES (:refund_id, :sale_detail_id, :product_id, :quantity, :unit_price, :refund_amount)"
+            );
+            $restoreStmt = $this->db->prepare(
+                "UPDATE Inventory SET quantity_on_hand = quantity_on_hand + :qty, updated_at = GETDATE() WHERE product_id = :pid"
+            );
+
+            foreach ($toApply as $line) {
+                $insertDetail->execute([
+                    ':refund_id'      => $refundId,
+                    ':sale_detail_id' => $line['sale_detail_id'],
+                    ':product_id'     => $line['product_id'],
+                    ':quantity'       => $line['quantity'],
+                    ':unit_price'     => $line['unit_price'],
+                    ':refund_amount'  => $line['refund_amount'],
+                ]);
+
+                $restoreStmt->bindValue(':qty', $line['quantity'], PDO::PARAM_INT);
+                $restoreStmt->bindValue(':pid', $line['product_id'], PDO::PARAM_INT);
+                $restoreStmt->execute();
+
+                InventoryMovement::log(
+                    $line['product_id'], 'sale_refund', $line['quantity'],
+                    'sale', $saleId, $sale['invoice_no'],
+                    $reason !== '' ? $reason : null, $userId
+                );
+            }
+
+            $this->db->commit();
+            return [$refundId, null];
+        } catch (Exception $e) {
+            $this->db->rollBack();
+            return [null, 'Could not process this refund. Please try again.'];
+        }
+    }
+
+    // -------------------------------------------------------------
     // Receipt
     // -------------------------------------------------------------
 
@@ -865,15 +1127,27 @@ class Sale
         }
 
         $itemStmt = $this->db->prepare(
-            "SELECT sd.quantity, sd.unit_price, sd.tax_amount, sd.discount_amount, sd.line_total,
-                    p.product_name, p.unit
-             FROM SaleDetails sd
+            "SELECT sd.sale_detail_id, sd.product_id, sd.quantity, sd.unit_price, sd.tax_amount,
+                    sd.discount_amount, sd.line_total, p.product_name, p.unit"
+            . ($this->refundsAvailable()
+                ? ", ISNULL((SELECT SUM(rd.quantity) FROM RefundDetails rd WHERE rd.sale_detail_id = sd.sale_detail_id), 0) AS refunded_quantity"
+                : ", 0 AS refunded_quantity")
+            . " FROM SaleDetails sd
              INNER JOIN Products p ON p.product_id = sd.product_id
              WHERE sd.sale_id = :id"
         );
         $itemStmt->bindValue(':id', $saleId, PDO::PARAM_INT);
         $itemStmt->execute();
-        $sale['items'] = $itemStmt->fetchAll();
+        $items = $itemStmt->fetchAll();
+        foreach ($items as &$item) {
+            $item['refunded_quantity'] = (int) $item['refunded_quantity'];
+            $item['refundable_quantity'] = max(0, (int) $item['quantity'] - $item['refunded_quantity']);
+        }
+        unset($item);
+        $sale['items'] = $items;
+
+        $sale['refunds'] = $this->refundsAvailable() ? $this->getRefunds($saleId) : [];
+        $sale['refund_total'] = round(array_sum(array_column($sale['refunds'], 'refund_amount')), 2);
 
         $paymentStmt = $this->db->prepare('SELECT payment_method, amount, payment_reference FROM SalePayments WHERE sale_id = :id ORDER BY sale_payment_id ASC');
         $paymentStmt->execute([':id' => $saleId]);

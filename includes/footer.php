@@ -14,12 +14,16 @@ if (!defined('POS_APP')) {
 </footer>
 
 <?php require_once __DIR__ . '/shift-modals.php'; ?>
+<?php require_once __DIR__ . '/chat-widget.php'; ?>
 
 <!-- jQuery -->
 <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
 <!-- Bootstrap 5 Bundle (includes Popper) -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<!-- Emoji picker for the chat widget composer -->
+<script type="module" src="https://cdn.jsdelivr.net/npm/emoji-picker-element@1/index.js"></script>
 <!-- App scripts -->
 <script src="<?= Helper::versionedAsset('/js/app.js') ?>"></script>
 <script src="<?= Helper::versionedAsset('/js/notifications.js') ?>"></script>
 <script src="<?= Helper::versionedAsset('/js/pos-shift.js') ?>"></script>
+<script src="<?= Helper::versionedAsset('/js/chat.js') ?>"></script>
