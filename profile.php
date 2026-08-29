@@ -25,6 +25,7 @@ $csrfToken = Security::generateCsrfToken();
         </main>
     </div>
     <?php require_once __DIR__ . '/includes/footer.php'; ?>
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script src="<?= Helper::versionedAsset('/js/profile.js') ?>"></script>
 </body>
 </html>

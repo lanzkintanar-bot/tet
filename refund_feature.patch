@@ -1,0 +1,845 @@
+diff -ruN '--exclude=.git' tet-original/app/controllers/SalesController.php tet-modified/app/controllers/SalesController.php
+--- tet-original/app/controllers/SalesController.php	2026-08-26 12:06:15.000000000 +0000
++++ tet-modified/app/controllers/SalesController.php	2026-08-26 22:24:53.889887421 +0000
+@@ -35,6 +35,7 @@
+             case 'list':  $this->list(); break;
+             case 'get':   $this->get(); break;
+             case 'void':  $this->void(); break;
++            case 'refund': $this->refund(); break;
+             case 'export_excel': $this->export('excel'); break;
+             case 'export_pdf':   $this->export('pdf'); break;
+             default: Helper::jsonResponse(false, 'Unknown action.', [], 400);
+@@ -89,6 +90,29 @@
+         Helper::jsonResponse(true, 'Sale voided and stock restored.');
+     }
+ 
++    private function refund(): void
++    {
++        Security::requireValidCsrfFromRequest();
++        SessionManager::requirePermission('sales.refund');
++
++        $id = (int) ($_POST['sale_id'] ?? 0);
++        if ($id <= 0) {
++            Helper::jsonResponse(false, 'Sale not found.', [], 404);
++        }
++
++        $items = json_decode($_POST['items'] ?? '[]', true);
++        $items = is_array($items) ? $items : [];
++        $reason = Security::sanitize(trim($_POST['reason'] ?? ''));
++
++        [$refundId, $error] = $this->saleModel->refund($id, $items, $reason, (int) SessionManager::get('user_id'));
++        if ($error) {
++            Helper::jsonResponse(false, $error, [], 422);
++        }
++
++        $this->userModel->logActivity((int) SessionManager::get('user_id'), 'SALE_REFUND', "Refunded items on sale #{$id} (refund #{$refundId})");
++        Helper::jsonResponse(true, 'Refund processed and stock restored.', ['refund_id' => $refundId]);
++    }
++
+     private function export(string $format): void
+     {
+         $filters = ['search' => Security::sanitize(trim($_GET['search'] ?? '')), 'status' => Security::sanitize($_GET['status'] ?? ''), 'date_from' => Security::sanitize($_GET['date_from'] ?? ''), 'date_to' => Security::sanitize($_GET['date_to'] ?? '')];
+diff -ruN '--exclude=.git' tet-original/app/models/InventoryMovement.php tet-modified/app/models/InventoryMovement.php
+--- tet-original/app/models/InventoryMovement.php	2026-08-26 12:06:15.000000000 +0000
++++ tet-modified/app/models/InventoryMovement.php	2026-08-26 22:24:53.890236301 +0000
+@@ -17,7 +17,7 @@
+ 
+ class InventoryMovement
+ {
+-    public const TYPES = ['purchase', 'purchase_cancel', 'sale', 'sale_void', 'adjustment'];
++    public const TYPES = ['purchase', 'purchase_cancel', 'sale', 'sale_void', 'sale_refund', 'adjustment'];
+ 
+     public static function log(
+         int $productId,
+diff -ruN '--exclude=.git' tet-original/app/models/Report.php tet-modified/app/models/Report.php
+--- tet-original/app/models/Report.php	2026-08-26 12:06:15.000000000 +0000
++++ tet-modified/app/models/Report.php	2026-08-26 22:24:53.890295028 +0000
+@@ -220,7 +220,13 @@
+         }, $stmt->fetchAll());
+     }
+ 
+-    /** Voided ("returned/refunded") sales in range - count + amount, for the Returns/Refunds KPI. */
++    /**
++     * Voided sales + item-level refunds in range, for the Returns/Refunds
++     * KPI - a voided sale is a whole transaction reversed outright, while
++     * a refund (database/migration_refunds.sql) is specific returned
++     * items on an otherwise-completed sale; both represent money handed
++     * back to a customer, so the KPI combines them.
++     */
+     public function returnsSummary(string $dateFrom, string $dateTo): array
+     {
+         $stmt = $this->db->prepare(
+@@ -233,9 +239,32 @@
+         $stmt->execute();
+         $row = $stmt->fetch();
+ 
++        $refundCount = 0;
++        $refundAmount = 0.0;
++        try {
++            $refundStmt = $this->db->prepare(
++                "SELECT ISNULL(COUNT(*), 0) AS refund_count, ISNULL(SUM(r.refund_amount), 0) AS refund_amount
++                 FROM Refunds r
++                 WHERE r.created_at BETWEEN :date_from AND :date_to"
++            );
++            $refundStmt->bindValue(':date_from', $dateFrom . ' 00:00:00', PDO::PARAM_STR);
++            $refundStmt->bindValue(':date_to', $dateTo . ' 23:59:59', PDO::PARAM_STR);
++            $refundStmt->execute();
++            $refundRow = $refundStmt->fetch();
++            $refundCount = (int) $refundRow['refund_count'];
++            $refundAmount = (float) $refundRow['refund_amount'];
++        } catch (\Throwable $e) {
++            // The Refunds/RefundDetails migration hasn't been run on this
++            // database yet - fall back to voided-sales-only, same as before.
++        }
++
+         return [
+             'voided_count'  => (int) $row['voided_count'],
+             'voided_amount' => round((float) $row['voided_amount'], 2),
++            'refund_count'  => $refundCount,
++            'refund_amount' => round($refundAmount, 2),
++            'total_count'   => (int) $row['voided_count'] + $refundCount,
++            'total_amount'  => round((float) $row['voided_amount'] + $refundAmount, 2),
+         ];
+     }
+ }
+diff -ruN '--exclude=.git' tet-original/app/models/Sale.php tet-modified/app/models/Sale.php
+--- tet-original/app/models/Sale.php	2026-08-26 12:06:15.000000000 +0000
++++ tet-modified/app/models/Sale.php	2026-08-26 22:24:53.890330161 +0000
+@@ -50,6 +50,28 @@
+         return $this->columnExists('shift_id');
+     }
+ 
++    /**
++     * Whether database/migration_refunds.sql (or a fresh pos_store.sql,
++     * which now includes it) has been run. Every refund-facing method
++     * below checks this first and degrades to a clear, friendly error
++     * instead of a raw "invalid object name" SQL error on a database
++     * that hasn't applied the migration yet.
++     */
++    private static ?bool $refundsTableAvailable = null;
++
++    private function refundsAvailable(): bool
++    {
++        if (self::$refundsTableAvailable === null) {
++            try {
++                $stmt = $this->db->query("SELECT OBJECT_ID('dbo.Refunds', 'U') AS id");
++                self::$refundsTableAvailable = !empty($stmt->fetch()['id']);
++            } catch (\Throwable $e) {
++                self::$refundsTableAvailable = false;
++            }
++        }
++        return self::$refundsTableAvailable;
++    }
++
+     private PDO $db;
+ 
+     public function __construct()
+@@ -744,10 +766,15 @@
+         $countStmt->execute($params);
+         $total = (int) $countStmt->fetch()['total'];
+ 
++        $refundedSql = $this->refundsAvailable()
++            ? '(SELECT ISNULL(SUM(r.refund_amount), 0) FROM Refunds r WHERE r.sale_id = s.sale_id)'
++            : '0';
++
+         $sql = "SELECT s.sale_id, s.invoice_no, s.grand_total, s.payment_method, s.status, s.created_at,
+                        s.branch_id, c.full_name AS customer_name, u.full_name AS cashier_name,
+                        b.branch_code, b.branch_name,
+-                       (SELECT COUNT(*) FROM SaleDetails sd WHERE sd.sale_id = s.sale_id) AS item_count
++                       (SELECT COUNT(*) FROM SaleDetails sd WHERE sd.sale_id = s.sale_id) AS item_count,
++                       {$refundedSql} AS refunded_amount
+                 {$base}
+                 ORDER BY s.{$sortBy} {$sortDir}
+                 OFFSET :offset ROWS FETCH NEXT :perPage ROWS ONLY";
+@@ -835,6 +862,207 @@
+     }
+ 
+     // -------------------------------------------------------------
++    // Refunds (item-level, partial-or-full - see database/migration_refunds.sql)
++    // -------------------------------------------------------------
++
++    /** Past refunds for a sale, newest first, each with its line items. */
++    public function getRefunds(int $saleId): array
++    {
++        if (!$this->refundsAvailable()) {
++            return [];
++        }
++
++        $stmt = $this->db->prepare(
++            "SELECT r.refund_id, r.reason, r.refund_amount, r.created_at, u.full_name AS user_name
++             FROM Refunds r
++             INNER JOIN Users u ON u.user_id = r.user_id
++             WHERE r.sale_id = :id
++             ORDER BY r.created_at DESC, r.refund_id DESC"
++        );
++        $stmt->bindValue(':id', $saleId, PDO::PARAM_INT);
++        $stmt->execute();
++        $refunds = $stmt->fetchAll();
++        if (!$refunds) {
++            return [];
++        }
++
++        $detailStmt = $this->db->prepare(
++            "SELECT rd.quantity, rd.refund_amount, p.product_name, p.unit
++             FROM RefundDetails rd
++             INNER JOIN Products p ON p.product_id = rd.product_id
++             WHERE rd.refund_id = :refund_id"
++        );
++        foreach ($refunds as &$refund) {
++            $refund['refund_amount'] = (float) $refund['refund_amount'];
++            $detailStmt->bindValue(':refund_id', $refund['refund_id'], PDO::PARAM_INT);
++            $detailStmt->execute();
++            $refund['items'] = $detailStmt->fetchAll();
++        }
++        unset($refund);
++
++        return $refunds;
++    }
++
++    /**
++     * Refunds specific quantities of specific line items on a completed
++     * sale: validates each request against what's actually left to
++     * refund (sold quantity minus whatever prior refunds already took),
++     * records a Refunds/RefundDetails row per line, restores the
++     * refunded quantity to Inventory, and logs an InventoryMovements
++     * row for each - mirroring void()'s stock-restoration pattern, but
++     * scoped to only the lines/quantities actually being returned.
++     *
++     * @param array $items [['sale_detail_id' => int, 'quantity' => int], ...]
++     *   Lines with quantity <= 0 are ignored (lets the UI submit every row
++     *   unconditionally without the caller having to filter first).
++     * @return array [refundId|null, error|null]
++     */
++    public function refund(int $saleId, array $items, string $reason, int $userId): array
++    {
++        if (!$this->refundsAvailable()) {
++            return [null, 'Refunds aren\'t set up on this database yet. Ask an administrator to run database/migration_refunds.sql.'];
++        }
++
++        $reason = trim($reason);
++
++        $this->db->beginTransaction();
++        try {
++            $stmt = $this->db->prepare("SELECT status, invoice_no FROM Sales WHERE sale_id = :id");
++            $stmt->bindValue(':id', $saleId, PDO::PARAM_INT);
++            $stmt->execute();
++            $sale = $stmt->fetch();
++
++            if (!$sale) {
++                $this->db->rollBack();
++                return [null, 'Sale not found.'];
++            }
++            if ($sale['status'] !== 'completed') {
++                $this->db->rollBack();
++                return [null, 'Only completed sales can be refunded.'];
++            }
++
++            // Lock this sale's lines (and their already-refunded totals)
++            // for the duration of the transaction, so two refunds against
++            // the same line submitted at the same moment can't both pass
++            // validation against the same "remaining" quantity.
++            $lineStmt = $this->db->prepare(
++                "SELECT sd.sale_detail_id, sd.product_id, sd.quantity, sd.unit_price, sd.line_total, p.product_name
++                 FROM SaleDetails sd WITH (UPDLOCK, HOLDLOCK)
++                 INNER JOIN Products p ON p.product_id = sd.product_id
++                 WHERE sd.sale_id = :id"
++            );
++            $lineStmt->bindValue(':id', $saleId, PDO::PARAM_INT);
++            $lineStmt->execute();
++            $linesById = [];
++            foreach ($lineStmt->fetchAll() as $line) {
++                $linesById[(int) $line['sale_detail_id']] = $line;
++            }
++            if (!$linesById) {
++                $this->db->rollBack();
++                return [null, 'This sale has no items to refund.'];
++            }
++
++            $refundedStmt = $this->db->prepare(
++                "SELECT ISNULL(SUM(quantity), 0) AS refunded FROM RefundDetails WHERE sale_detail_id = :sale_detail_id"
++            );
++
++            $toApply = [];
++            $refundTotal = 0.0;
++            foreach ($items as $item) {
++                $saleDetailId = (int) ($item['sale_detail_id'] ?? 0);
++                $qty = (int) ($item['quantity'] ?? 0);
++                if ($qty <= 0) {
++                    continue;
++                }
++                if (!isset($linesById[$saleDetailId])) {
++                    $this->db->rollBack();
++                    return [null, 'One of the selected items does not belong to this sale.'];
++                }
++
++                $line = $linesById[$saleDetailId];
++                $refundedStmt->bindValue(':sale_detail_id', $saleDetailId, PDO::PARAM_INT);
++                $refundedStmt->execute();
++                $alreadyRefunded = (int) $refundedStmt->fetch()['refunded'];
++                $remaining = (int) $line['quantity'] - $alreadyRefunded;
++
++                if ($qty > $remaining) {
++                    $this->db->rollBack();
++                    $available = max(0, $remaining);
++                    return [null, "Cannot refund {$qty} x \"{$line['product_name']}\" - only {$available} left to refund."];
++                }
++
++                $perUnit = ((float) $line['line_total']) / max(1, (int) $line['quantity']);
++                $lineRefund = round($perUnit * $qty, 2);
++                $refundTotal += $lineRefund;
++
++                $toApply[] = [
++                    'sale_detail_id' => $saleDetailId,
++                    'product_id'     => (int) $line['product_id'],
++                    'quantity'       => $qty,
++                    'unit_price'     => (float) $line['unit_price'],
++                    'refund_amount'  => $lineRefund,
++                    'product_name'   => $line['product_name'],
++                ];
++            }
++
++            if (!$toApply) {
++                $this->db->rollBack();
++                return [null, 'Select at least one item and quantity to refund.'];
++            }
++
++            $refundTotal = round($refundTotal, 2);
++
++            $insertRefund = $this->db->prepare(
++                "INSERT INTO Refunds (sale_id, invoice_no, user_id, reason, refund_amount, created_at)
++                 OUTPUT INSERTED.refund_id
++                 VALUES (:sale_id, :invoice_no, :user_id, :reason, :refund_amount, GETDATE())"
++            );
++            $insertRefund->bindValue(':sale_id', $saleId, PDO::PARAM_INT);
++            $insertRefund->bindValue(':invoice_no', $sale['invoice_no'], PDO::PARAM_STR);
++            $insertRefund->bindValue(':user_id', $userId, PDO::PARAM_INT);
++            $insertRefund->bindValue(':reason', $reason !== '' ? $reason : null, $reason !== '' ? PDO::PARAM_STR : PDO::PARAM_NULL);
++            $insertRefund->bindValue(':refund_amount', $refundTotal);
++            $insertRefund->execute();
++            $refundId = (int) $insertRefund->fetch()['refund_id'];
++
++            $insertDetail = $this->db->prepare(
++                "INSERT INTO RefundDetails (refund_id, sale_detail_id, product_id, quantity, unit_price, refund_amount)
++                 VALUES (:refund_id, :sale_detail_id, :product_id, :quantity, :unit_price, :refund_amount)"
++            );
++            $restoreStmt = $this->db->prepare(
++                "UPDATE Inventory SET quantity_on_hand = quantity_on_hand + :qty, updated_at = GETDATE() WHERE product_id = :pid"
++            );
++
++            foreach ($toApply as $line) {
++                $insertDetail->execute([
++                    ':refund_id'      => $refundId,
++                    ':sale_detail_id' => $line['sale_detail_id'],
++                    ':product_id'     => $line['product_id'],
++                    ':quantity'       => $line['quantity'],
++                    ':unit_price'     => $line['unit_price'],
++                    ':refund_amount'  => $line['refund_amount'],
++                ]);
++
++                $restoreStmt->bindValue(':qty', $line['quantity'], PDO::PARAM_INT);
++                $restoreStmt->bindValue(':pid', $line['product_id'], PDO::PARAM_INT);
++                $restoreStmt->execute();
++
++                InventoryMovement::log(
++                    $line['product_id'], 'sale_refund', $line['quantity'],
++                    'sale', $saleId, $sale['invoice_no'],
++                    $reason !== '' ? $reason : null, $userId
++                );
++            }
++
++            $this->db->commit();
++            return [$refundId, null];
++        } catch (Exception $e) {
++            $this->db->rollBack();
++            return [null, 'Could not process this refund. Please try again.'];
++        }
++    }
++
++    // -------------------------------------------------------------
+     // Receipt
+     // -------------------------------------------------------------
+ 
+@@ -865,15 +1093,27 @@
+         }
+ 
+         $itemStmt = $this->db->prepare(
+-            "SELECT sd.quantity, sd.unit_price, sd.tax_amount, sd.discount_amount, sd.line_total,
+-                    p.product_name, p.unit
+-             FROM SaleDetails sd
++            "SELECT sd.sale_detail_id, sd.product_id, sd.quantity, sd.unit_price, sd.tax_amount,
++                    sd.discount_amount, sd.line_total, p.product_name, p.unit"
++            . ($this->refundsAvailable()
++                ? ", ISNULL((SELECT SUM(rd.quantity) FROM RefundDetails rd WHERE rd.sale_detail_id = sd.sale_detail_id), 0) AS refunded_quantity"
++                : ", 0 AS refunded_quantity")
++            . " FROM SaleDetails sd
+              INNER JOIN Products p ON p.product_id = sd.product_id
+              WHERE sd.sale_id = :id"
+         );
+         $itemStmt->bindValue(':id', $saleId, PDO::PARAM_INT);
+         $itemStmt->execute();
+-        $sale['items'] = $itemStmt->fetchAll();
++        $items = $itemStmt->fetchAll();
++        foreach ($items as &$item) {
++            $item['refunded_quantity'] = (int) $item['refunded_quantity'];
++            $item['refundable_quantity'] = max(0, (int) $item['quantity'] - $item['refunded_quantity']);
++        }
++        unset($item);
++        $sale['items'] = $items;
++
++        $sale['refunds'] = $this->refundsAvailable() ? $this->getRefunds($saleId) : [];
++        $sale['refund_total'] = round(array_sum(array_column($sale['refunds'], 'refund_amount')), 2);
+ 
+         $paymentStmt = $this->db->prepare('SELECT payment_method, amount, payment_reference FROM SalePayments WHERE sale_id = :id ORDER BY sale_payment_id ASC');
+         $paymentStmt->execute([':id' => $saleId]);
+diff -ruN '--exclude=.git' tet-original/assets/js/reports.js tet-modified/assets/js/reports.js
+--- tet-original/assets/js/reports.js	2026-08-26 12:06:15.000000000 +0000
++++ tet-modified/assets/js/reports.js	2026-08-26 22:24:53.891383976 +0000
+@@ -86,9 +86,14 @@
+         $('#statExpenseCount').text(summary.expense_total > 0 ? 'in this range' : '0 recorded');
+         $('#statNetProfit').text(money(summary.net_profit));
+ 
+-        const returns = returnsSummary || { voided_count: 0, voided_amount: 0 };
+-        $('#statReturns').text(money(returns.voided_amount));
+-        $('#statReturnsCount').text(returns.voided_count + ' voided sale' + (returns.voided_count === 1 ? '' : 's'));
++        const returns = returnsSummary || { voided_count: 0, voided_amount: 0, refund_count: 0, refund_amount: 0, total_count: 0, total_amount: 0 };
++        $('#statReturns').text(money(returns.total_amount != null ? returns.total_amount : returns.voided_amount));
++        const voidedCount = returns.voided_count || 0;
++        const refundCount = returns.refund_count || 0;
++        const parts = [];
++        if (voidedCount > 0) parts.push(voidedCount + ' voided sale' + (voidedCount === 1 ? '' : 's'));
++        if (refundCount > 0) parts.push(refundCount + ' refund' + (refundCount === 1 ? '' : 's'));
++        $('#statReturnsCount').text(parts.length ? parts.join(', ') : '0 voided sales or refunds');
+     }
+ 
+     function renderExpenses(expenses) {
+diff -ruN '--exclude=.git' tet-original/assets/js/sales.js tet-modified/assets/js/sales.js
+--- tet-original/assets/js/sales.js	2026-08-26 12:06:15.000000000 +0000
++++ tet-modified/assets/js/sales.js	2026-08-26 22:24:53.891414939 +0000
+@@ -10,6 +10,7 @@
+     let state = { search: '', status: '', dateFrom: '', dateTo: '', sortBy: 'created_at', sortDir: 'DESC', page: 1, perPage: 10 };
+     let searchDebounce = null;
+     let activeSaleId = null;
++    let activeSale = null;
+ 
+     function escapeHtml(str) { return $('<div>').text(str == null ? '' : str).html(); }
+     function money(n) { return '₱' + Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+@@ -29,6 +30,8 @@
+         }
+ 
+         rows.forEach(function (row) {
++            const refunded = Number(row.refunded_amount || 0);
++            const refundedNote = refunded > 0 ? `<div class="text-muted small">-${money(refunded)} refunded</div>` : '';
+             $body.append($(`
+                 <tr>
+                     <td class="font-monospace">${escapeHtml(row.invoice_no)}</td>
+@@ -37,7 +40,7 @@
+                     <td>${escapeHtml(row.cashier_name)}</td>
+                     <td>${row.item_count}</td>
+                     <td class="text-uppercase text-muted small">${escapeHtml(row.payment_method)}</td>
+-                    <td class="font-monospace">${money(row.grand_total)}</td>
++                    <td class="font-monospace">${money(row.grand_total)}${refundedNote}</td>
+                     <td>${statusBadge(row.status)}</td>
+                     <td class="text-end">
+                         <button class="btn btn-sm pos-icon-btn-table btn-view" data-id="${row.sale_id}" title="View"><i class="bi bi-eye"></i></button>
+@@ -89,15 +92,29 @@
+     function renderReceipt(sale) {
+         let itemLines = '';
+         sale.items.forEach(function (item) {
++            const refundedNote = Number(item.refunded_quantity || 0) > 0
++                ? ` <span class="text-muted small">(${item.refunded_quantity} refunded)</span>` : '';
+             itemLines += `
+                 <div class="pos-receipt-line">
+-                    <span>${escapeHtml(item.product_name)}</span>
++                    <span>${escapeHtml(item.product_name)}${refundedNote}</span>
+                     <span>${item.quantity}${escapeHtml(item.unit)}</span>
+                     <span>${money(item.line_total)}</span>
+                 </div>
+             `;
+         });
+ 
++        let refundLines = '';
++        (sale.refunds || []).forEach(function (refund) {
++            const itemSummary = (refund.items || []).map(function (i) { return `${i.quantity}x ${escapeHtml(i.product_name)}`; }).join(', ');
++            refundLines += `
++                <div class="pos-receipt-line">
++                    <span class="text-muted small">Refund &middot; ${escapeHtml(refund.created_at)} &middot; ${escapeHtml(refund.user_name)}${itemSummary ? ' &middot; ' + itemSummary : ''}${refund.reason ? ' &middot; ' + escapeHtml(refund.reason) : ''}</span>
++                    <span></span>
++                    <span class="text-danger">-${money(refund.refund_amount)}</span>
++                </div>
++            `;
++        });
++
+         $('#saleReceiptContent').html(`
+             <div class="pos-receipt-head text-center">
+                 <div class="fw-semibold">${escapeHtml(sale.invoice_no)}</div>
+@@ -114,10 +131,15 @@
+             <div class="pos-receipt-line pos-receipt-total"><span>Total</span><span></span><span>${money(sale.grand_total)}</span></div>
+             ${(sale.payments || [{ payment_method: sale.payment_method, amount: sale.amount_paid }]).map(function (payment) { return `<div class="pos-receipt-line"><span>${escapeHtml(String(payment.payment_method).toUpperCase())}${payment.payment_reference ? ' · ' + escapeHtml(payment.payment_reference) : ''}</span><span></span><span>${money(payment.amount)}</span></div>`; }).join('')}
+             <div class="pos-receipt-line"><span>Change</span><span></span><span>${money(sale.change_due)}</span></div>
++            ${refundLines ? '<div class="pos-receipt-divider"></div>' + refundLines + `<div class="pos-receipt-line"><span>Total Refunded</span><span></span><span class="text-danger">-${money(sale.refund_total || 0)}</span></div>` : ''}
+         `);
+ 
+         activeSaleId = sale.sale_id;
++        activeSale = sale;
+         $('#btnVoidSale').toggleClass('d-none', sale.status !== 'completed');
++        const hasRefundableItems = sale.status === 'completed'
++            && (sale.items || []).some(function (item) { return Number(item.refundable_quantity) > 0; });
++        $('#btnOpenRefund').toggleClass('d-none', !hasRefundableItems);
+     }
+ 
+     function viewSale(id) {
+@@ -128,6 +150,89 @@
+         });
+     }
+ 
++    function updateRefundTotal() {
++        let total = 0;
++        $('#refundItemsBody tr').each(function () {
++            const $row = $(this);
++            const qty = parseInt($row.find('.refund-qty-input').val(), 10) || 0;
++            const perUnit = parseFloat($row.data('per-unit')) || 0;
++            total += qty * perUnit;
++        });
++        $('#refundTotalAmount').text(money(total));
++    }
++
++    function renderRefundItems(sale) {
++        const $body = $('#refundItemsBody').empty();
++        (sale.items || []).forEach(function (item) {
++            const refundable = Number(item.refundable_quantity || 0);
++            if (refundable <= 0) return;
++            const perUnit = Number(item.quantity) > 0 ? (Number(item.line_total) / Number(item.quantity)) : 0;
++            const $row = $(`
++                <tr data-sale-detail-id="${item.sale_detail_id}" data-per-unit="${perUnit}">
++                    <td>${escapeHtml(item.product_name)}</td>
++                    <td class="text-center">${item.quantity}</td>
++                    <td class="text-center">${item.refunded_quantity}</td>
++                    <td class="text-center">
++                        <input type="number" class="form-control form-control-sm refund-qty-input text-center"
++                               min="0" max="${refundable}" step="1" value="0">
++                    </td>
++                    <td class="text-end refund-line-amount">${money(0)}</td>
++                </tr>
++            `);
++            $body.append($row);
++        });
++
++        if (!$body.children().length) {
++            $body.html('<tr><td colspan="5" class="text-center text-muted py-3">Nothing left to refund on this sale.</td></tr>');
++        }
++
++        $('#refundReason').val('');
++        updateRefundTotal();
++    }
++
++    function openRefundModal() {
++        if (!activeSale) return;
++        renderRefundItems(activeSale);
++        new bootstrap.Modal('#saleRefundModal').show();
++    }
++
++    function submitRefund() {
++        if (!activeSaleId) return;
++
++        const items = [];
++        $('#refundItemsBody tr[data-sale-detail-id]').each(function () {
++            const $row = $(this);
++            const qty = parseInt($row.find('.refund-qty-input').val(), 10) || 0;
++            if (qty > 0) {
++                items.push({ sale_detail_id: parseInt($row.data('sale-detail-id'), 10), quantity: qty });
++            }
++        });
++
++        if (!items.length) {
++            alert('Enter a quantity for at least one item to refund.');
++            return;
++        }
++        if (!confirm('Process this refund? Refunded quantities will be added back to inventory.')) return;
++
++        const $btn = $('#btnConfirmRefund').prop('disabled', true);
++        $.ajax({
++            url: ENDPOINT, method: 'POST', dataType: 'json',
++            data: { action: 'refund', sale_id: activeSaleId, items: JSON.stringify(items), reason: $('#refundReason').val() },
++        }).done(function (res) {
++            if (res.success) {
++                bootstrap.Modal.getInstance(document.getElementById('saleRefundModal')).hide();
++                loadList();
++                viewSale(activeSaleId);
++            } else {
++                alert(res.message || 'Could not process this refund.');
++            }
++        }).fail(function (jq) {
++            alert((jq.responseJSON && jq.responseJSON.message) || 'Could not process this refund.');
++        }).always(function () {
++            $btn.prop('disabled', false);
++        });
++    }
++
+     $(function () {
+         loadList();
+ 
+@@ -170,5 +275,21 @@
+                 })
+                 .fail(function (jq) { alert((jq.responseJSON && jq.responseJSON.message) || 'Could not void this sale.'); });
+         });
++
++        $('#btnOpenRefund').on('click', function () { openRefundModal(); });
++
++        $(document).on('input', '#refundItemsBody .refund-qty-input', function () {
++            const $row = $(this).closest('tr');
++            const max = parseInt($(this).attr('max'), 10) || 0;
++            let qty = parseInt($(this).val(), 10) || 0;
++            if (qty < 0) qty = 0;
++            if (qty > max) qty = max;
++            $(this).val(qty);
++            const perUnit = parseFloat($row.data('per-unit')) || 0;
++            $row.find('.refund-line-amount').text(money(qty * perUnit));
++            updateRefundTotal();
++        });
++
++        $('#btnConfirmRefund').on('click', function () { submitRefund(); });
+     });
+ })(jQuery);
+diff -ruN '--exclude=.git' tet-original/database/migration_refunds.sql tet-modified/database/migration_refunds.sql
+--- tet-original/database/migration_refunds.sql	1970-01-01 00:00:00.000000000 +0000
++++ tet-modified/database/migration_refunds.sql	2026-08-26 22:24:53.893533146 +0000
+@@ -0,0 +1,105 @@
++/* =========================================================================
++   database/migration_refunds.sql
++   -------------------------------------------------------------------------
++   Adds item-level, partial-or-full Refunds for completed sales:
++
++     1. dbo.Refunds        - one row per refund transaction against a sale
++                              (who processed it, why, and the total amount).
++     2. dbo.RefundDetails  - the specific SaleDetails line(s)/quantities
++                              that were returned in that refund.
++     3. Permission 'sales.refund' - gates the new "Refund" action
++                              separately from 'sales.view' (which only
++                              covers looking at Sales History).
++
++   This is deliberately a different concept from Sales.status = 'voided'
++   (see Sale::void()): voiding reverses an entire transaction outright
++   (e.g. it was rung up by mistake) and stock for every line goes back.
++   A refund happens after the fact, for specific returned items/quantities
++   only, and the sale itself stays 'completed' - "how much has been
++   refunded" is derived from SUM(RefundDetails.quantity) rather than
++   duplicated onto Sales/SaleDetails, so there's nothing to keep in sync.
++
++   Refunding a line restores that quantity to Inventory and logs an
++   InventoryMovements row (movement_type = 'sale_refund'), the same way
++   Sale::void() already does for a full void.
++
++   Safe to re-run - only adds what's missing. Run this against a database
++   that already ran pos_store.sql (or run pos_store.sql fresh - it now
++   already includes all of this).
++   ========================================================================= */
++
++IF OBJECT_ID('dbo.Refunds', 'U') IS NULL
++CREATE TABLE dbo.Refunds (
++    refund_id     INT IDENTITY(1,1) PRIMARY KEY,
++    sale_id       INT NOT NULL,
++    invoice_no    NVARCHAR(50) NOT NULL,
++    user_id       INT NOT NULL,
++    reason        NVARCHAR(255) NULL,
++    refund_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
++    created_at    DATETIME NOT NULL DEFAULT GETDATE(),
++    CONSTRAINT FK_Refunds_Sale FOREIGN KEY (sale_id) REFERENCES dbo.Sales(sale_id),
++    CONSTRAINT FK_Refunds_User FOREIGN KEY (user_id) REFERENCES dbo.Users(user_id)
++);
++GO
++
++IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Refunds_Sale')
++CREATE INDEX IX_Refunds_Sale ON dbo.Refunds(sale_id);
++GO
++
++IF OBJECT_ID('dbo.RefundDetails', 'U') IS NULL
++CREATE TABLE dbo.RefundDetails (
++    refund_detail_id INT IDENTITY(1,1) PRIMARY KEY,
++    refund_id        INT NOT NULL,
++    sale_detail_id   INT NOT NULL,
++    product_id       INT NOT NULL,
++    quantity         INT NOT NULL,
++    unit_price       DECIMAL(12,2) NOT NULL,
++    refund_amount    DECIMAL(12,2) NOT NULL DEFAULT 0,
++    CONSTRAINT FK_RefundDetails_Refund FOREIGN KEY (refund_id) REFERENCES dbo.Refunds(refund_id) ON DELETE CASCADE,
++    CONSTRAINT FK_RefundDetails_SaleDetail FOREIGN KEY (sale_detail_id) REFERENCES dbo.SaleDetails(sale_detail_id),
++    CONSTRAINT FK_RefundDetails_Product FOREIGN KEY (product_id) REFERENCES dbo.Products(product_id)
++);
++GO
++
++IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_RefundDetails_Refund')
++CREATE INDEX IX_RefundDetails_Refund ON dbo.RefundDetails(refund_id);
++GO
++IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_RefundDetails_SaleDetail')
++CREATE INDEX IX_RefundDetails_SaleDetail ON dbo.RefundDetails(sale_detail_id);
++GO
++
++IF NOT EXISTS (SELECT 1 FROM dbo.Permissions WHERE permission_key = 'sales.refund')
++INSERT INTO dbo.Permissions (permission_key, description)
++VALUES ('sales.refund', 'Process refunds for completed sales');
++GO
++
++/* Backfill onto roles that already have permissions rows - the seed
++   INSERT in pos_store.sql only fires for a role with ZERO permissions,
++   so on an existing database Administrator/Manager need this granted
++   explicitly, the same way migration_default_role_permissions.sql did
++   for earlier additions. Administrator gets it unconditionally; Manager
++   gets it because Manager can already void a sale (SalesController's
++   void action has never required a permission beyond 'sales.view'), so
++   this keeps refund and void available to the same roles by default. */
++IF NOT EXISTS (SELECT 1 FROM dbo.RolePermissions rp
++               INNER JOIN dbo.Roles r ON r.role_id = rp.role_id
++               INNER JOIN dbo.Permissions p ON p.permission_id = rp.permission_id
++               WHERE r.role_name = 'Administrator' AND p.permission_key = 'sales.refund')
++INSERT INTO dbo.RolePermissions (role_id, permission_id)
++SELECT r.role_id, p.permission_id
++FROM dbo.Roles r CROSS JOIN dbo.Permissions p
++WHERE r.role_name = 'Administrator' AND p.permission_key = 'sales.refund';
++GO
++
++IF NOT EXISTS (SELECT 1 FROM dbo.RolePermissions rp
++               INNER JOIN dbo.Roles r ON r.role_id = rp.role_id
++               INNER JOIN dbo.Permissions p ON p.permission_id = rp.permission_id
++               WHERE r.role_name = 'Manager' AND p.permission_key = 'sales.refund')
++INSERT INTO dbo.RolePermissions (role_id, permission_id)
++SELECT r.role_id, p.permission_id
++FROM dbo.Roles r CROSS JOIN dbo.Permissions p
++WHERE r.role_name = 'Manager' AND p.permission_key = 'sales.refund'
++AND EXISTS (SELECT 1 FROM dbo.RolePermissions rp2
++            INNER JOIN dbo.Permissions p2 ON p2.permission_id = rp2.permission_id
++            WHERE rp2.role_id = r.role_id AND p2.permission_key = 'sales.view');
++GO
+diff -ruN '--exclude=.git' tet-original/database/pos_store.sql tet-modified/database/pos_store.sql
+--- tet-original/database/pos_store.sql	2026-08-26 12:06:15.000000000 +0000
++++ tet-modified/database/pos_store.sql	2026-08-26 22:24:53.893480989 +0000
+@@ -320,6 +320,57 @@
+ GO
+ 
+ /* -------------------------------------------------------------------
++   Refunds / Refund Details
++   -------------------------------------------------------------------
++   Item-level, partial-or-full refunds against a COMPLETED sale - a
++   different thing from Sales.status = 'voided' (Sale::void(), which
++   reverses an entire transaction outright, e.g. it was rung up by
++   mistake). A refund happens after the fact, for specific returned
++   line items/quantities, and the original sale stays 'completed' -
++   how much of it has been refunded is derived from these two tables
++   (SUM(RefundDetails.quantity) per sale_detail_id) rather than stored
++   redundantly on Sales/SaleDetails. See database/migration_refunds.sql
++   for the full comment and for backfilling this onto an existing DB.
++   ------------------------------------------------------------------- */
++
++IF OBJECT_ID('dbo.Refunds', 'U') IS NULL
++CREATE TABLE dbo.Refunds (
++    refund_id     INT IDENTITY(1,1) PRIMARY KEY,
++    sale_id       INT NOT NULL,
++    invoice_no    NVARCHAR(50) NOT NULL,        -- snapshot of Sales.invoice_no at refund time
++    user_id       INT NOT NULL,                 -- who processed the refund
++    reason        NVARCHAR(255) NULL,
++    refund_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
++    created_at    DATETIME NOT NULL DEFAULT GETDATE(),
++    CONSTRAINT FK_Refunds_Sale FOREIGN KEY (sale_id) REFERENCES dbo.Sales(sale_id),
++    CONSTRAINT FK_Refunds_User FOREIGN KEY (user_id) REFERENCES dbo.Users(user_id)
++);
++GO
++
++CREATE INDEX IX_Refunds_Sale ON dbo.Refunds(sale_id);
++GO
++
++IF OBJECT_ID('dbo.RefundDetails', 'U') IS NULL
++CREATE TABLE dbo.RefundDetails (
++    refund_detail_id INT IDENTITY(1,1) PRIMARY KEY,
++    refund_id        INT NOT NULL,
++    sale_detail_id   INT NOT NULL,               -- which original sale line this quantity came off
++    product_id       INT NOT NULL,
++    quantity         INT NOT NULL,
++    unit_price       DECIMAL(12,2) NOT NULL,      -- snapshot of the line's unit price at sale time
++    refund_amount    DECIMAL(12,2) NOT NULL DEFAULT 0,
++    CONSTRAINT FK_RefundDetails_Refund FOREIGN KEY (refund_id) REFERENCES dbo.Refunds(refund_id) ON DELETE CASCADE,
++    CONSTRAINT FK_RefundDetails_SaleDetail FOREIGN KEY (sale_detail_id) REFERENCES dbo.SaleDetails(sale_detail_id),
++    CONSTRAINT FK_RefundDetails_Product FOREIGN KEY (product_id) REFERENCES dbo.Products(product_id)
++);
++GO
++
++CREATE INDEX IX_RefundDetails_Refund ON dbo.RefundDetails(refund_id);
++GO
++CREATE INDEX IX_RefundDetails_SaleDetail ON dbo.RefundDetails(sale_detail_id);
++GO
++
++/* -------------------------------------------------------------------
+    Purchases / Purchase Details
+    ------------------------------------------------------------------- */
+ 
+@@ -465,7 +516,7 @@
+  ('categories.manage','Manage categories, units and brands'), ('suppliers.manage','Manage suppliers'),
+  ('customers.manage','Manage customers and loyalty'), ('purchases.manage','Record purchases'),
+  ('inventory.manage','View and adjust inventory'), ('ledger.view','View item ledger'),
+- ('sales.view','View sales history'), ('sales.export','Export sales'), ('reports.print','Print reports'),
++ ('sales.view','View sales history'), ('sales.refund','Process refunds for completed sales'), ('sales.export','Export sales'), ('reports.print','Print reports'),
+  ('activity_logs.view','View activity logs'), ('customer_reports.view','View and export customer reports'),
+  ('reconciliation.manage','Manage Transaction Record & End of Day Reconciliation')
+ ) v(permission_key, description)
+@@ -505,7 +556,7 @@
+ FROM dbo.Permissions WHERE permission_key IN (
+     'dashboard.view', 'pos.access', 'products.manage', 'categories.manage',
+     'suppliers.manage', 'customers.manage', 'purchases.manage', 'inventory.manage',
+-    'ledger.view', 'sales.view', 'sales.export', 'reports.view', 'reports.print',
++    'ledger.view', 'sales.view', 'sales.refund', 'sales.export', 'reports.view', 'reports.print',
+     'customer_reports.view', 'reconciliation.manage'
+ );
+ GO
+diff -ruN '--exclude=.git' tet-original/views/sales.php tet-modified/views/sales.php
+--- tet-original/views/sales.php	2026-08-26 12:06:15.000000000 +0000
++++ tet-modified/views/sales.php	2026-08-26 22:24:53.901506155 +0000
+@@ -76,9 +76,51 @@
+                 <div class="pos-receipt" id="saleReceiptContent"></div>
+             </div>
+             <div class="modal-footer">
++                <button class="btn btn-outline-warning d-none" type="button" id="btnOpenRefund">Refund</button>
+                 <button class="btn btn-outline-danger d-none" type="button" id="btnVoidSale">Void Sale</button>
+                 <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Close</button>
+             </div>
+         </div>
+     </div>
++</div>
++
++<!-- Refund modal -->
++<div class="modal fade" id="saleRefundModal" tabindex="-1" aria-hidden="true">
++    <div class="modal-dialog modal-dialog-centered">
++        <div class="modal-content">
++            <div class="modal-header">
++                <h5 class="modal-title">Refund Items</h5>
++                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
++            </div>
++            <div class="modal-body">
++                <p class="text-muted small mb-2">Enter the quantity to refund for each item. Refunded stock is added back to inventory.</p>
++                <div class="table-responsive">
++                    <table class="table table-sm align-middle">
++                        <thead>
++                            <tr>
++                                <th>Item</th>
++                                <th class="text-center">Sold</th>
++                                <th class="text-center">Refunded</th>
++                                <th class="text-center" style="width: 110px;">Refund Qty</th>
++                                <th class="text-end">Amount</th>
++                            </tr>
++                        </thead>
++                        <tbody id="refundItemsBody"></tbody>
++                    </table>
++                </div>
++                <div class="mb-3">
++                    <label class="form-label small text-muted" for="refundReason">Reason (optional)</label>
++                    <textarea class="form-control" id="refundReason" rows="2" placeholder="e.g. Customer returned item, wrong size..."></textarea>
++                </div>
++                <div class="d-flex justify-content-between align-items-center pos-receipt-total px-1">
++                    <span>Refund Total</span>
++                    <span id="refundTotalAmount">₱0.00</span>
++                </div>
++            </div>
++            <div class="modal-footer">
++                <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Cancel</button>
++                <button class="btn btn-warning" type="button" id="btnConfirmRefund">Process Refund</button>
++            </div>
++        </div>
++    </div>
+ </div>
