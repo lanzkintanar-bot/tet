@@ -76,8 +76,50 @@ if (!defined('POS_APP')) {
                 <div class="pos-receipt" id="saleReceiptContent"></div>
             </div>
             <div class="modal-footer">
+                <button class="btn btn-outline-warning d-none" type="button" id="btnOpenRefund">Refund</button>
                 <button class="btn btn-outline-danger d-none" type="button" id="btnVoidSale">Void Sale</button>
                 <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Refund modal -->
+<div class="modal fade" id="saleRefundModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Refund Items</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-muted small mb-2">Enter the quantity to refund for each item. Refunded stock is added back to inventory.</p>
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Item</th>
+                                <th class="text-center">Sold</th>
+                                <th class="text-center">Refunded</th>
+                                <th class="text-center" style="width: 110px;">Refund Qty</th>
+                                <th class="text-end">Amount</th>
+                            </tr>
+                        </thead>
+                        <tbody id="refundItemsBody"></tbody>
+                    </table>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label small text-muted" for="refundReason">Reason (optional)</label>
+                    <textarea class="form-control" id="refundReason" rows="2" placeholder="e.g. Customer returned item, wrong size..."></textarea>
+                </div>
+                <div class="d-flex justify-content-between align-items-center pos-receipt-total px-1">
+                    <span>Refund Total</span>
+                    <span id="refundTotalAmount">₱0.00</span>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Cancel</button>
+                <button class="btn btn-warning" type="button" id="btnConfirmRefund">Process Refund</button>
             </div>
         </div>
     </div>

@@ -87,6 +87,22 @@ CREATE TABLE dbo.UserTokens (
 );
 GO
 
+/* Personal "approval badge" QR codes (POS Screen -> manager override for
+   price edits/discounts, see database/migration_pos_override.sql). One
+   active badge per user - generating a new one replaces the old, same
+   selector/validator-hash pattern as UserTokens above, just with no
+   expiry (a badge is meant to be printed/kept, not session-scoped). */
+IF OBJECT_ID('dbo.UserQrTokens', 'U') IS NULL
+CREATE TABLE dbo.UserQrTokens (
+    token_id       INT IDENTITY(1,1) PRIMARY KEY,
+    user_id        INT NOT NULL UNIQUE,
+    selector       NVARCHAR(32)  NOT NULL UNIQUE,
+    validator_hash NVARCHAR(64)  NOT NULL,
+    created_at     DATETIME      NOT NULL DEFAULT GETDATE(),
+    CONSTRAINT FK_UserQrTokens_User FOREIGN KEY (user_id) REFERENCES dbo.Users(user_id) ON DELETE CASCADE
+);
+GO
+
 IF OBJECT_ID('dbo.LoginLogs', 'U') IS NULL
 CREATE TABLE dbo.LoginLogs (
     log_id        INT IDENTITY(1,1) PRIMARY KEY,
@@ -166,6 +182,7 @@ CREATE TABLE dbo.Products (
     image_path      NVARCHAR(255) NULL,
     cost_price      DECIMAL(12,2) NOT NULL DEFAULT 0,
     selling_price   DECIMAL(12,2) NOT NULL DEFAULT 0,
+    wholesale_price DECIMAL(12,2) NULL,                    -- NULL = no wholesale price set for this item
     tax_rate        DECIMAL(5,2)  NOT NULL DEFAULT 0,     -- percent
     discount_rate   DECIMAL(5,2)  NOT NULL DEFAULT 0,     -- percent
     unit            NVARCHAR(20)  NOT NULL DEFAULT 'pc',
@@ -320,6 +337,57 @@ CREATE TABLE dbo.SaleDetails (
 GO
 
 /* -------------------------------------------------------------------
+   Refunds / Refund Details
+   -------------------------------------------------------------------
+   Item-level, partial-or-full refunds against a COMPLETED sale - a
+   different thing from Sales.status = 'voided' (Sale::void(), which
+   reverses an entire transaction outright, e.g. it was rung up by
+   mistake). A refund happens after the fact, for specific returned
+   line items/quantities, and the original sale stays 'completed' -
+   how much of it has been refunded is derived from these two tables
+   (SUM(RefundDetails.quantity) per sale_detail_id) rather than stored
+   redundantly on Sales/SaleDetails. See database/migration_refunds.sql
+   for the full comment and for backfilling this onto an existing DB.
+   ------------------------------------------------------------------- */
+
+IF OBJECT_ID('dbo.Refunds', 'U') IS NULL
+CREATE TABLE dbo.Refunds (
+    refund_id     INT IDENTITY(1,1) PRIMARY KEY,
+    sale_id       INT NOT NULL,
+    invoice_no    NVARCHAR(50) NOT NULL,        -- snapshot of Sales.invoice_no at refund time
+    user_id       INT NOT NULL,                 -- who processed the refund
+    reason        NVARCHAR(255) NULL,
+    refund_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+    created_at    DATETIME NOT NULL DEFAULT GETDATE(),
+    CONSTRAINT FK_Refunds_Sale FOREIGN KEY (sale_id) REFERENCES dbo.Sales(sale_id),
+    CONSTRAINT FK_Refunds_User FOREIGN KEY (user_id) REFERENCES dbo.Users(user_id)
+);
+GO
+
+CREATE INDEX IX_Refunds_Sale ON dbo.Refunds(sale_id);
+GO
+
+IF OBJECT_ID('dbo.RefundDetails', 'U') IS NULL
+CREATE TABLE dbo.RefundDetails (
+    refund_detail_id INT IDENTITY(1,1) PRIMARY KEY,
+    refund_id        INT NOT NULL,
+    sale_detail_id   INT NOT NULL,               -- which original sale line this quantity came off
+    product_id       INT NOT NULL,
+    quantity         INT NOT NULL,
+    unit_price       DECIMAL(12,2) NOT NULL,      -- snapshot of the line's unit price at sale time
+    refund_amount    DECIMAL(12,2) NOT NULL DEFAULT 0,
+    CONSTRAINT FK_RefundDetails_Refund FOREIGN KEY (refund_id) REFERENCES dbo.Refunds(refund_id) ON DELETE CASCADE,
+    CONSTRAINT FK_RefundDetails_SaleDetail FOREIGN KEY (sale_detail_id) REFERENCES dbo.SaleDetails(sale_detail_id),
+    CONSTRAINT FK_RefundDetails_Product FOREIGN KEY (product_id) REFERENCES dbo.Products(product_id)
+);
+GO
+
+CREATE INDEX IX_RefundDetails_Refund ON dbo.RefundDetails(refund_id);
+GO
+CREATE INDEX IX_RefundDetails_SaleDetail ON dbo.RefundDetails(sale_detail_id);
+GO
+
+/* -------------------------------------------------------------------
    Purchases / Purchase Details
    ------------------------------------------------------------------- */
 
@@ -465,7 +533,8 @@ SELECT v.permission_key, v.description FROM (VALUES
  ('categories.manage','Manage categories, units and brands'), ('suppliers.manage','Manage suppliers'),
  ('customers.manage','Manage customers and loyalty'), ('purchases.manage','Record purchases'),
  ('inventory.manage','View and adjust inventory'), ('ledger.view','View item ledger'),
- ('sales.view','View sales history'), ('sales.export','Export sales'), ('reports.print','Print reports'),
+ ('sales.view','View sales history'), ('sales.refund','Process refunds for completed sales'), ('sales.export','Export sales'), ('reports.print','Print reports'),
+ ('pos.override_price','Approve price overrides and discounts at the register'),
  ('activity_logs.view','View activity logs'), ('customer_reports.view','View and export customer reports'),
  ('reconciliation.manage','Manage Transaction Record & End of Day Reconciliation')
 ) v(permission_key, description)
@@ -505,8 +574,8 @@ SELECT (SELECT role_id FROM dbo.Roles WHERE role_name = 'Manager'), permission_i
 FROM dbo.Permissions WHERE permission_key IN (
     'dashboard.view', 'pos.access', 'products.manage', 'categories.manage',
     'suppliers.manage', 'customers.manage', 'purchases.manage', 'inventory.manage',
-    'ledger.view', 'sales.view', 'sales.export', 'reports.view', 'reports.print',
-    'customer_reports.view', 'reconciliation.manage'
+    'ledger.view', 'sales.view', 'sales.refund', 'sales.export', 'reports.view', 'reports.print',
+    'customer_reports.view', 'reconciliation.manage', 'pos.override_price'
 );
 GO
 
@@ -550,7 +619,8 @@ INSERT INTO dbo.Settings (setting_key, setting_value) VALUES
     ('email_smtp_port', '587'),
     ('email_smtp_username', 'notifications.service.do.not.reply@gmail.com'),
     ('email_smtp_password', 'oxqahcsaxwzmhniu'),
-    ('store_icon_path', '');
+    ('store_icon_path', ''),
+    ('wholesale_pricing_enabled', '0');
 GO
 
 IF OBJECT_ID('dbo.EmailPasswordResetTokens', 'U') IS NULL
@@ -564,6 +634,58 @@ CREATE TABLE dbo.EmailPasswordResetTokens (
     created_at DATETIME NOT NULL DEFAULT GETDATE(),
     CONSTRAINT FK_EmailPasswordResetTokens_User FOREIGN KEY (user_id) REFERENCES dbo.Users(user_id)
 );
+GO
+
+/* -------------------------------------------------------------------
+   Internal chat (Staff <-> Owner/Manager support) - see
+   database/migration_chat.sql for the full write-up. One 'general'
+   conversation always exists (seeded below) that every logged-in user
+   can read/post to; 'direct' conversations are private 1-on-1 threads
+   started on demand between any two users.
+   ------------------------------------------------------------------- */
+IF OBJECT_ID('dbo.ChatConversations', 'U') IS NULL
+CREATE TABLE dbo.ChatConversations (
+    conversation_id INT IDENTITY(1,1) PRIMARY KEY,
+    type            NVARCHAR(10) NOT NULL DEFAULT 'direct', -- 'general' or 'direct'
+    created_at      DATETIME NOT NULL DEFAULT GETDATE()
+);
+GO
+
+IF OBJECT_ID('dbo.ChatParticipants', 'U') IS NULL
+CREATE TABLE dbo.ChatParticipants (
+    conversation_id INT NOT NULL,
+    user_id         INT NOT NULL,
+    last_read_at    DATETIME NULL,
+    joined_at       DATETIME NOT NULL DEFAULT GETDATE(),
+    PRIMARY KEY (conversation_id, user_id),
+    CONSTRAINT FK_ChatParticipants_Conversation FOREIGN KEY (conversation_id) REFERENCES dbo.ChatConversations(conversation_id) ON DELETE CASCADE,
+    CONSTRAINT FK_ChatParticipants_User FOREIGN KEY (user_id) REFERENCES dbo.Users(user_id)
+);
+GO
+
+IF OBJECT_ID('dbo.ChatMessages', 'U') IS NULL
+CREATE TABLE dbo.ChatMessages (
+    message_id       INT IDENTITY(1,1) PRIMARY KEY,
+    conversation_id  INT NOT NULL,
+    sender_id        INT NOT NULL,
+    body             NVARCHAR(2000) NULL,
+    attachment_path  NVARCHAR(255) NULL,
+    attachment_name  NVARCHAR(255) NULL,
+    attachment_mime  NVARCHAR(100) NULL,
+    attachment_size  INT NULL,
+    created_at       DATETIME NOT NULL DEFAULT GETDATE(),
+    CONSTRAINT FK_ChatMessages_Conversation FOREIGN KEY (conversation_id) REFERENCES dbo.ChatConversations(conversation_id) ON DELETE CASCADE,
+    CONSTRAINT FK_ChatMessages_Sender FOREIGN KEY (sender_id) REFERENCES dbo.Users(user_id)
+);
+GO
+
+CREATE INDEX IX_ChatMessages_Conversation ON dbo.ChatMessages(conversation_id, created_at);
+GO
+CREATE INDEX IX_ChatParticipants_User ON dbo.ChatParticipants(user_id);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM dbo.ChatConversations WHERE type = 'general')
+INSERT INTO dbo.ChatConversations (type) VALUES ('general');
 GO
 
 /* -------------------------------------------------------------------

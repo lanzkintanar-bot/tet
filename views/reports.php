@@ -11,10 +11,10 @@ if (!defined('POS_APP')) {
     <div class="d-flex gap-2 flex-wrap align-items-center">
         <button type="button" class="btn btn-sm btn-outline-secondary" id="btnPrintReport"><i class="bi bi-printer me-1"></i>Print / PDF</button>
         <div class="btn-group btn-group-sm" role="group" id="reportPresets">
-            <button type="button" class="btn btn-outline-secondary" data-preset="today">Today</button>
+            <button type="button" class="btn btn-outline-secondary active" data-preset="today">Today</button>
             <button type="button" class="btn btn-outline-secondary" data-preset="yesterday">Yesterday</button>
             <button type="button" class="btn btn-outline-secondary" data-preset="week">This Week</button>
-            <button type="button" class="btn btn-outline-secondary active" data-preset="month">This Month</button>
+            <button type="button" class="btn btn-outline-secondary" data-preset="month">This Month</button>
             <button type="button" class="btn btn-outline-secondary" data-preset="year">This Year</button>
         </div>
         <input type="date" class="form-control form-control-sm pos-select" id="reportDateFrom" style="max-width: 150px;">
