@@ -1031,6 +1031,56 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: var(--pos-border
 .pos-chat-bubble-row.mine .pos-chat-bubble { background: var(--pos-fill-dark); color: #fff; border-bottom-right-radius: 4px; }
 .pos-chat-bubble-row.theirs .pos-chat-bubble { background: var(--pos-bg); color: var(--pos-ink); border-bottom-left-radius: 4px; }
 .pos-chat-bubble-time { font-size: .62rem; color: var(--pos-muted); margin-top: 2px; padding: 0 2px; }
+.pos-chat-typing-indicator { font-size: .72rem; color: var(--pos-muted); font-style: italic; padding: 0 12px 4px; }
+
+/* ---- Video calling ---- */
+.pos-call-incoming {
+    position: fixed; top: 16px; right: 16px; z-index: 1095;
+    display: flex; align-items: center; gap: 14px;
+    background: var(--pos-ink-2, #1f2937); color: #fff;
+    padding: 12px 14px; border-radius: 12px;
+    box-shadow: 0 10px 28px rgba(0,0,0,.28);
+    max-width: min(360px, calc(100vw - 32px));
+}
+.pos-call-incoming-info { display: flex; align-items: center; gap: 8px; font-size: .85rem; flex: 1; min-width: 0; }
+.pos-call-incoming-info i { color: #4ade80; font-size: 1.1rem; }
+.pos-call-incoming-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.pos-call-btn {
+    width: 38px; height: 38px; border-radius: 50%; border: none;
+    display: inline-flex; align-items: center; justify-content: center; font-size: 1rem; color: #fff;
+}
+.pos-call-btn.accept { background: #22c55e; }
+.pos-call-btn.decline { background: #ef4444; }
+
+.pos-call-overlay {
+    position: fixed; inset: 0; z-index: 1096; background: #0b0f14;
+    display: flex; flex-direction: column;
+}
+.pos-call-remote-wrap { position: relative; flex: 1; min-height: 0; }
+.pos-call-remote-video { width: 100%; height: 100%; object-fit: contain; background: #0b0f14; }
+.pos-call-local-video {
+    position: absolute; bottom: 16px; right: 16px; width: 130px; height: 174px;
+    object-fit: cover; border-radius: 10px; border: 2px solid rgba(255,255,255,.25);
+    background: #111; transform: scaleX(-1); /* mirror, like a selfie camera */
+}
+.pos-call-status {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: rgba(255,255,255,.85); font-size: 1rem; text-align: center;
+}
+.pos-call-controls {
+    display: flex; justify-content: center; gap: 16px; padding: 16px;
+    background: rgba(255,255,255,.04);
+}
+.pos-call-ctrl-btn {
+    width: 52px; height: 52px; border-radius: 50%; border: none;
+    background: rgba(255,255,255,.14); color: #fff; font-size: 1.15rem;
+    display: inline-flex; align-items: center; justify-content: center;
+}
+.pos-call-ctrl-btn.active { background: rgba(255,255,255,.35); }
+.pos-call-ctrl-btn.end { background: #ef4444; }
+@media (max-width: 575.98px) {
+    .pos-call-local-video { width: 96px; height: 128px; }
+}
 .pos-chat-bubble-image { max-width: 100%; border-radius: 10px; display: block; margin-top: 4px; cursor: pointer; }
 .pos-chat-bubble-file {
   display: flex; align-items: center; gap: 6px; margin-top: 4px; padding: 6px 10px; border-radius: 8px;

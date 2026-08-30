@@ -34,6 +34,9 @@ class ReportController
             case 'summary':      $this->summary(); break;
             case 'add_expense':  $this->addExpense(); break;
             case 'delete_expense': $this->deleteExpense(); break;
+            case 'cashier_payment_breakdown':    $this->cashierPaymentBreakdown(); break;
+            case 'export_cashier_payment_excel': $this->exportCashierPaymentExcel(); break;
+            case 'export_cashier_payment_pdf':   $this->exportCashierPaymentPdf(); break;
             default: Helper::jsonResponse(false, 'Unknown action.', [], 400);
         }
     }
@@ -108,6 +111,98 @@ class ReportController
         }
 
         return [$validFrom, $validTo];
+    }
+
+    // -------------------------------------------------------------
+    // Cashier x Payment Method report (its own filters + Excel/PDF export)
+    // -------------------------------------------------------------
+
+    /** @return array [dateFrom, dateTo, cashierId|null, paymentMethod|null] */
+    private function resolveCashierPaymentFilters(): array
+    {
+        [$dateFrom, $dateTo] = $this->resolveDateRange();
+
+        $cashierId = (int) ($_GET['cashier_id'] ?? 0);
+        $cashierId = $cashierId > 0 ? $cashierId : null;
+
+        $paymentMethod = strtolower(trim((string) ($_GET['payment_method'] ?? '')));
+        $paymentMethod = array_key_exists($paymentMethod, Report::CASHIER_PAYMENT_METHODS) ? $paymentMethod : null;
+
+        return [$dateFrom, $dateTo, $cashierId, $paymentMethod];
+    }
+
+    private function cashierPaymentBreakdown(): void
+    {
+        [$dateFrom, $dateTo, $cashierId, $paymentMethod] = $this->resolveCashierPaymentFilters();
+        $result = $this->reportModel->cashierPaymentBreakdown($dateFrom, $dateTo, $cashierId, $paymentMethod);
+        $cashierName = $cashierId !== null ? ($this->reportModel->cashierName($cashierId) ?? 'Unknown Cashier') : 'All Cashiers';
+
+        Helper::jsonResponse(true, '', [
+            'date_from'      => $dateFrom,
+            'date_to'        => $dateTo,
+            'cashier_id'     => $cashierId,
+            'cashier_name'   => $cashierName,
+            'payment_method' => $paymentMethod,
+            'cashiers'       => $this->reportModel->cashiersWithSales($dateFrom, $dateTo),
+            'payment_methods' => Report::CASHIER_PAYMENT_METHODS,
+            'summary'        => $result['summary'],
+            'breakdown'      => $result['breakdown'],
+        ]);
+    }
+
+    /** @return array [dateFrom, dateTo, breakdown result, filenameLabel, titleLabel] shared by both export formats */
+    private function cashierPaymentExportData(): array
+    {
+        [$dateFrom, $dateTo, $cashierId, $paymentMethod] = $this->resolveCashierPaymentFilters();
+        $result = $this->reportModel->cashierPaymentBreakdown($dateFrom, $dateTo, $cashierId, $paymentMethod);
+        $cashierName = $cashierId !== null ? ($this->reportModel->cashierName($cashierId) ?? 'Unknown Cashier') : 'All Cashiers';
+
+        $labelParts = [$cashierName];
+        if ($paymentMethod !== null) {
+            $labelParts[] = Report::CASHIER_PAYMENT_METHODS[$paymentMethod];
+        }
+
+        return [$dateFrom, $dateTo, $result, implode(' - ', $labelParts)];
+    }
+
+    private function exportCashierPaymentExcel(): void
+    {
+        [$dateFrom, $dateTo, $result, $label] = $this->cashierPaymentExportData();
+
+        $headers = ['Cashier', 'Payment Method', 'Transactions', 'Revenue'];
+        $rows = [];
+        foreach ($result['breakdown'] as $row) {
+            $rows[] = [$row['cashier_name'], strtoupper($row['payment_method']), $row['transaction_count'], $row['revenue']];
+        }
+        $rows[] = ['TOTAL', '', $result['summary']['transaction_count'], $result['summary']['revenue']];
+
+        $sheetName = substr($label . ' ' . $dateFrom . ' to ' . $dateTo, 0, 31);
+        $filename = 'cashier_payment_report_' . preg_replace('/[^A-Za-z0-9]+/', '_', $label) . '_' . $dateFrom . '_to_' . $dateTo;
+
+        XlsxWriter::stream($filename, $headers, $rows, $sheetName);
+    }
+
+    private function exportCashierPaymentPdf(): void
+    {
+        [$dateFrom, $dateTo, $result, $label] = $this->cashierPaymentExportData();
+
+        $headers = ['Cashier', 'Payment Method', 'Transactions', 'Revenue'];
+        $colWidths = [190, 120, 90, 115];
+
+        $rows = [];
+        foreach ($result['breakdown'] as $row) {
+            $rows[] = [$row['cashier_name'], strtoupper($row['payment_method']), (string) $row['transaction_count'], number_format($row['revenue'], 2)];
+        }
+        $rows[] = ['TOTAL', '', (string) $result['summary']['transaction_count'], number_format($result['summary']['revenue'], 2)];
+
+        $title = 'Cashier & Payment Method Report - ' . $label;
+        $subtitle = $dateFrom . ' to ' . $dateTo
+            . ' | Transactions: ' . $result['summary']['transaction_count']
+            . ' | Revenue: ' . number_format($result['summary']['revenue'], 2)
+            . ' | Avg. Sale: ' . number_format($result['summary']['average_sale'], 2);
+        $filename = 'cashier_payment_report_' . preg_replace('/[^A-Za-z0-9]+/', '_', $label) . '_' . $dateFrom . '_to_' . $dateTo;
+
+        PdfWriter::stream($filename, $title, $subtitle, $headers, $colWidths, $rows);
     }
 }
 

@@ -44,6 +44,22 @@ class Chat
         return self::$chatTablesAvailable;
     }
 
+    private static ?bool $callTablesAvailable = null;
+
+    /** Separate from isAvailable() so chat keeps working on a DB where migration_chat_video_calls.sql hasn't been run yet - only the call-specific actions need this. */
+    public function isCallAvailable(): bool
+    {
+        if (self::$callTablesAvailable === null) {
+            try {
+                $stmt = $this->db->query("SELECT OBJECT_ID('dbo.ChatCalls', 'U') AS id");
+                self::$callTablesAvailable = !empty($stmt->fetch()['id']);
+            } catch (\Throwable $e) {
+                self::$callTablesAvailable = false;
+            }
+        }
+        return self::$callTablesAvailable;
+    }
+
     private function generalConversationId(): int
     {
         $stmt = $this->db->query("SELECT TOP 1 conversation_id FROM ChatConversations WHERE type = 'general'");
@@ -56,10 +72,12 @@ class Chat
     {
         $stmt = $this->db->prepare(
             "IF NOT EXISTS (SELECT 1 FROM ChatParticipants WHERE conversation_id = :cid AND user_id = :uid)
-             INSERT INTO ChatParticipants (conversation_id, user_id, last_read_at) VALUES (:cid, :uid, :read_at)"
+             INSERT INTO ChatParticipants (conversation_id, user_id, last_read_at) VALUES (:cid2, :uid2, :read_at)"
         );
         $stmt->bindValue(':cid', $conversationId, PDO::PARAM_INT);
         $stmt->bindValue(':uid', $userId, PDO::PARAM_INT);
+        $stmt->bindValue(':cid2', $conversationId, PDO::PARAM_INT);
+        $stmt->bindValue(':uid2', $userId, PDO::PARAM_INT);
         $stmt->bindValue(':read_at', $caughtUp ? date('Y-m-d H:i:s') : null, $caughtUp ? PDO::PARAM_STR : PDO::PARAM_NULL);
         $stmt->execute();
     }
@@ -278,6 +296,34 @@ class Chat
         return [$messages, null];
     }
 
+    /** Stamps $userId as actively typing in $conversationId right now. Cheap and short-lived on purpose - getTypingUsers() only trusts it for a few seconds. */
+    public function setTyping(int $conversationId, int $userId): void
+    {
+        if (!$this->canAccess($conversationId, $userId)) {
+            return;
+        }
+        $this->ensureParticipant($conversationId, $userId, false);
+        $stmt = $this->db->prepare("UPDATE ChatParticipants SET typing_at = GETDATE() WHERE conversation_id = :cid AND user_id = :uid");
+        $stmt->bindValue(':cid', $conversationId, PDO::PARAM_INT);
+        $stmt->bindValue(':uid', $userId, PDO::PARAM_INT);
+        $stmt->execute();
+    }
+
+    /** Names of everyone else currently (within the last few seconds) typing in $conversationId, for the "X is typing..." line above the composer. */
+    public function getTypingUsers(int $conversationId, int $userId): array
+    {
+        $stmt = $this->db->prepare(
+            "SELECT u.full_name FROM ChatParticipants p
+             INNER JOIN Users u ON u.user_id = p.user_id
+             WHERE p.conversation_id = :cid AND p.user_id != :self
+             AND p.typing_at IS NOT NULL AND p.typing_at > DATEADD(SECOND, -5, GETDATE())"
+        );
+        $stmt->bindValue(':cid', $conversationId, PDO::PARAM_INT);
+        $stmt->bindValue(':self', $userId, PDO::PARAM_INT);
+        $stmt->execute();
+        return array_column($stmt->fetchAll(), 'full_name');
+    }
+
     public function markRead(int $conversationId, int $userId): void
     {
         if (!$this->canAccess($conversationId, $userId)) {
@@ -379,5 +425,288 @@ class Chat
             'mime' => $realMime,
             'size' => (int) $file['size'],
         ], null];
+    }
+
+    // -------------------------------------------------------------
+    // Video/audio calls (1-on-1 only - see migration_chat_video_calls.sql)
+    // -------------------------------------------------------------
+
+    private const CALL_RING_TIMEOUT_SECONDS = 45;
+    private const CALL_STALE_ACTIVE_SECONDS = 20; // how long an 'accepted' call can go unpolled by either side before it's assumed abandoned
+    private const CALL_SDP_MAX_LENGTH = 20000;
+
+    /**
+     * Self-healing cleanup, run at the top of every call read/write - no
+     * cron job needed:
+     *   - a 'ringing' call nobody answered in time becomes 'missed'.
+     *   - an 'accepted' call neither side has polled recently (see
+     *     touchCallActivity()) is assumed abandoned - e.g. a tab closed,
+     *     the network dropped, or the browser crashed without a clean
+     *     hangup - and gets force-closed so it stops blocking new calls
+     *     in that conversation.
+     */
+    private function expireStaleRingingCalls(): void
+    {
+        $stmt = $this->db->prepare(
+            "UPDATE ChatCalls SET status = 'missed', ended_at = GETDATE()
+             WHERE status = 'ringing' AND started_at < DATEADD(SECOND, :ringTimeout, GETDATE())"
+        );
+        $stmt->bindValue(':ringTimeout', -self::CALL_RING_TIMEOUT_SECONDS, PDO::PARAM_INT);
+        $stmt->execute();
+
+        $stmt = $this->db->prepare(
+            "UPDATE ChatCalls SET status = 'ended', ended_at = GETDATE()
+             WHERE status = 'accepted'
+             AND (last_activity_at IS NULL OR last_activity_at < DATEADD(SECOND, :activeTimeout, GETDATE()))
+             AND (answered_at IS NULL OR answered_at < DATEADD(SECOND, :activeTimeout2, GETDATE()))"
+        );
+        $stmt->bindValue(':activeTimeout', -self::CALL_STALE_ACTIVE_SECONDS, PDO::PARAM_INT);
+        $stmt->bindValue(':activeTimeout2', -self::CALL_STALE_ACTIVE_SECONDS, PDO::PARAM_INT);
+        $stmt->execute();
+    }
+
+    /** Marks $callId as still in use - called every time either side polls it, which happens every ~1.2s while a call is up (see pollCallProgress() in chat.js), so this is a free liveness signal with no extra requests. */
+    private function touchCallActivity(int $callId): void
+    {
+        $stmt = $this->db->prepare("UPDATE ChatCalls SET last_activity_at = GETDATE() WHERE call_id = :id");
+        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
+        $stmt->execute();
+    }
+
+    /** @return array{caller_id:int,callee_id:int}|null */
+    private function callParticipants(int $callId): ?array
+    {
+        $stmt = $this->db->prepare("SELECT caller_id, callee_id FROM ChatCalls WHERE call_id = :id");
+        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
+        $stmt->execute();
+        $row = $stmt->fetch();
+        return $row ? ['caller_id' => (int) $row['caller_id'], 'callee_id' => (int) $row['callee_id']] : null;
+    }
+
+    private function formatCall(array $row, int $viewerId): array
+    {
+        return [
+            'call_id' => (int) $row['call_id'],
+            'conversation_id' => (int) $row['conversation_id'],
+            'caller_id' => (int) $row['caller_id'],
+            'callee_id' => (int) $row['callee_id'],
+            'is_caller' => (int) $row['caller_id'] === $viewerId,
+            'status' => $row['status'],
+            'offer_sdp' => $row['offer_sdp'] ?? null,
+            'answer_sdp' => $row['answer_sdp'] ?? null,
+        ];
+    }
+
+    /**
+     * Starts a call from $callerId to whoever else is in $conversationId.
+     * Only valid for 'direct' conversations - a video call to everyone in
+     * 'General' would need real multi-party infrastructure this app
+     * doesn't have.
+     * @return array [call|null, error|null]
+     */
+    public function startCall(int $conversationId, int $callerId, string $offerSdp): array
+    {
+        if (!$this->canAccess($conversationId, $callerId)) {
+            return [null, "You don't have access to this conversation."];
+        }
+        if (mb_strlen($offerSdp) > self::CALL_SDP_MAX_LENGTH) {
+            return [null, 'Could not start the call (invalid session data).'];
+        }
+
+        $convStmt = $this->db->prepare("SELECT type FROM ChatConversations WHERE conversation_id = :id");
+        $convStmt->bindValue(':id', $conversationId, PDO::PARAM_INT);
+        $convStmt->execute();
+        $conversation = $convStmt->fetch();
+        if (!$conversation || $conversation['type'] !== 'direct') {
+            return [null, 'Video calls are only available in direct conversations.'];
+        }
+
+        $otherStmt = $this->db->prepare(
+            "SELECT u.user_id, u.full_name FROM ChatParticipants p
+             INNER JOIN Users u ON u.user_id = p.user_id
+             WHERE p.conversation_id = :cid AND p.user_id != :self"
+        );
+        $otherStmt->bindValue(':cid', $conversationId, PDO::PARAM_INT);
+        $otherStmt->bindValue(':self', $callerId, PDO::PARAM_INT);
+        $otherStmt->execute();
+        $other = $otherStmt->fetch();
+        if (!$other) {
+            return [null, 'The other person in this conversation could not be found.'];
+        }
+        $calleeId = (int) $other['user_id'];
+
+        $this->expireStaleRingingCalls();
+
+        $existingStmt = $this->db->prepare(
+            "SELECT TOP 1 call_id FROM ChatCalls WHERE conversation_id = :cid AND status IN ('ringing', 'accepted')"
+        );
+        $existingStmt->bindValue(':cid', $conversationId, PDO::PARAM_INT);
+        $existingStmt->execute();
+        if ($existingStmt->fetch()) {
+            return [null, 'A call is already in progress in this conversation.'];
+        }
+
+        $stmt = $this->db->prepare(
+            "INSERT INTO ChatCalls (conversation_id, caller_id, callee_id, status, offer_sdp, started_at)
+             OUTPUT INSERTED.call_id
+             VALUES (:cid, :caller, :callee, 'ringing', :offer, GETDATE())"
+        );
+        $stmt->bindValue(':cid', $conversationId, PDO::PARAM_INT);
+        $stmt->bindValue(':caller', $callerId, PDO::PARAM_INT);
+        $stmt->bindValue(':callee', $calleeId, PDO::PARAM_INT);
+        $stmt->bindValue(':offer', $offerSdp, PDO::PARAM_STR);
+        $stmt->execute();
+        $callId = (int) $stmt->fetch()['call_id'];
+
+        return [[
+            'call_id' => $callId,
+            'callee_id' => $calleeId,
+            'callee_name' => $other['full_name'],
+        ], null];
+    }
+
+    /** Ringing calls for $userId to answer - polled globally (chat panel open or not) so an incoming call is never missed just because the widget happens to be closed. */
+    public function getIncomingCalls(int $userId): array
+    {
+        $this->expireStaleRingingCalls();
+
+        $stmt = $this->db->prepare(
+            "SELECT c.call_id, c.conversation_id, c.caller_id, u.full_name AS caller_name, c.offer_sdp
+             FROM ChatCalls c
+             INNER JOIN Users u ON u.user_id = c.caller_id
+             WHERE c.callee_id = :uid AND c.status = 'ringing'
+             ORDER BY c.started_at DESC"
+        );
+        $stmt->bindValue(':uid', $userId, PDO::PARAM_INT);
+        $stmt->execute();
+        $rows = $stmt->fetchAll();
+        foreach ($rows as &$row) {
+            $row['call_id'] = (int) $row['call_id'];
+            $row['conversation_id'] = (int) $row['conversation_id'];
+            $row['caller_id'] = (int) $row['caller_id'];
+        }
+        unset($row);
+        return $rows;
+    }
+
+    /**
+     * Called by both sides while a call is ringing/connecting/active - the
+     * caller uses it to notice the answer SDP the moment the callee picks
+     * up, and both sides use it to notice a decline/hangup on the other end.
+     * @return array [call|null, error|null]
+     */
+    public function getCallStatus(int $callId, int $userId): array
+    {
+        $this->expireStaleRingingCalls();
+
+        $participants = $this->callParticipants($callId);
+        if (!$participants || !in_array($userId, [$participants['caller_id'], $participants['callee_id']], true)) {
+            return [null, 'Call not found.'];
+        }
+
+        $this->touchCallActivity($callId);
+
+        $stmt = $this->db->prepare("SELECT * FROM ChatCalls WHERE call_id = :id");
+        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
+        $stmt->execute();
+        $row = $stmt->fetch();
+        return [$this->formatCall($row, $userId), null];
+    }
+
+    /** @return array [call|null, error|null] */
+    public function answerCall(int $callId, int $userId, string $answerSdp): array
+    {
+        if (mb_strlen($answerSdp) > self::CALL_SDP_MAX_LENGTH) {
+            return [null, 'Could not answer the call (invalid session data).'];
+        }
+        $this->expireStaleRingingCalls();
+
+        $participants = $this->callParticipants($callId);
+        if (!$participants || $participants['callee_id'] !== $userId) {
+            return [null, 'Call not found.'];
+        }
+
+        $stmt = $this->db->prepare(
+            "UPDATE ChatCalls SET status = 'accepted', answer_sdp = :answer, answered_at = GETDATE()
+             WHERE call_id = :id AND status = 'ringing'"
+        );
+        $stmt->bindValue(':answer', $answerSdp, PDO::PARAM_STR);
+        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
+        $stmt->execute();
+        if ($stmt->rowCount() === 0) {
+            return [null, 'This call is no longer available.'];
+        }
+
+        return $this->getCallStatus($callId, $userId);
+    }
+
+    public function declineCall(int $callId, int $userId): void
+    {
+        $participants = $this->callParticipants($callId);
+        if (!$participants || $participants['callee_id'] !== $userId) {
+            return;
+        }
+        $stmt = $this->db->prepare(
+            "UPDATE ChatCalls SET status = 'declined', ended_at = GETDATE(), ended_by = :uid
+             WHERE call_id = :id AND status = 'ringing'"
+        );
+        $stmt->bindValue(':uid', $userId, PDO::PARAM_INT);
+        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
+        $stmt->execute();
+    }
+
+    /** Either side can hang up, whether the call is still ringing (cancel) or already connected. */
+    public function endCall(int $callId, int $userId): void
+    {
+        $participants = $this->callParticipants($callId);
+        if (!$participants || !in_array($userId, [$participants['caller_id'], $participants['callee_id']], true)) {
+            return;
+        }
+        $stmt = $this->db->prepare(
+            "UPDATE ChatCalls SET status = 'ended', ended_at = GETDATE(), ended_by = :uid
+             WHERE call_id = :id AND status IN ('ringing', 'accepted')"
+        );
+        $stmt->bindValue(':uid', $userId, PDO::PARAM_INT);
+        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
+        $stmt->execute();
+    }
+
+    /** Trickled ICE candidate from $userId's side of $callId, for the other side to pick up via getIceCandidates(). */
+    public function addIceCandidate(int $callId, int $userId, string $candidateJson): void
+    {
+        if (mb_strlen($candidateJson) > self::CALL_SDP_MAX_LENGTH) {
+            return;
+        }
+        $participants = $this->callParticipants($callId);
+        if (!$participants || !in_array($userId, [$participants['caller_id'], $participants['callee_id']], true)) {
+            return;
+        }
+        $stmt = $this->db->prepare(
+            "INSERT INTO ChatCallSignals (call_id, sender_id, candidate, created_at) VALUES (:cid, :uid, :candidate, GETDATE())"
+        );
+        $stmt->bindValue(':cid', $callId, PDO::PARAM_INT);
+        $stmt->bindValue(':uid', $userId, PDO::PARAM_INT);
+        $stmt->bindValue(':candidate', $candidateJson, PDO::PARAM_STR);
+        $stmt->execute();
+    }
+
+    /** ICE candidates from the OTHER side of $callId since $sinceId - each side only ever needs the ones it didn't send itself. */
+    public function getIceCandidates(int $callId, int $userId, int $sinceId): array
+    {
+        $participants = $this->callParticipants($callId);
+        if (!$participants || !in_array($userId, [$participants['caller_id'], $participants['callee_id']], true)) {
+            return [];
+        }
+        $this->touchCallActivity($callId);
+        $stmt = $this->db->prepare(
+            "SELECT signal_id, candidate FROM ChatCallSignals
+             WHERE call_id = :cid AND sender_id != :self AND signal_id > :since
+             ORDER BY signal_id ASC"
+        );
+        $stmt->bindValue(':cid', $callId, PDO::PARAM_INT);
+        $stmt->bindValue(':self', $userId, PDO::PARAM_INT);
+        $stmt->bindValue(':since', $sinceId, PDO::PARAM_INT);
+        $stmt->execute();
+        return $stmt->fetchAll();
     }
 }

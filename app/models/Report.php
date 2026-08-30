@@ -267,4 +267,109 @@ class Report
             'total_amount'  => round((float) $row['voided_amount'] + $refundAmount, 2),
         ];
     }
+
+    // -------------------------------------------------------------
+    // Cashier x Payment Method report (its own filterable report -
+    // separate from the main Reports page summary above)
+    // -------------------------------------------------------------
+
+    public const CASHIER_PAYMENT_METHODS = ['cash' => 'Cash', 'gcash' => 'GCash', 'maya' => 'Maya', 'card' => 'Card', 'check' => 'Check'];
+
+    /** Cashiers who actually rang up a completed sale in the range - populates the report's cashier dropdown with only relevant names instead of every registered user. */
+    public function cashiersWithSales(string $dateFrom, string $dateTo): array
+    {
+        $stmt = $this->db->prepare(
+            "SELECT DISTINCT u.user_id, u.full_name
+             FROM Sales s
+             INNER JOIN Users u ON u.user_id = s.user_id
+             WHERE s.status = 'completed' AND s.created_at BETWEEN :date_from AND :date_to
+             ORDER BY u.full_name ASC"
+        );
+        $stmt->bindValue(':date_from', $dateFrom . ' 00:00:00', PDO::PARAM_STR);
+        $stmt->bindValue(':date_to', $dateTo . ' 23:59:59', PDO::PARAM_STR);
+        $stmt->execute();
+
+        return array_map(function ($row) {
+            return ['user_id' => (int) $row['user_id'], 'full_name' => $row['full_name']];
+        }, $stmt->fetchAll());
+    }
+
+    /** A cashier's name for the report title/export filename when a specific one is selected. */
+    public function cashierName(int $userId): ?string
+    {
+        $stmt = $this->db->prepare("SELECT full_name FROM Users WHERE user_id = :id");
+        $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
+        $stmt->execute();
+        $row = $stmt->fetch();
+        return $row ? $row['full_name'] : null;
+    }
+
+    /**
+     * Revenue broken down by cashier AND payment method, optionally
+     * narrowed to one cashier and/or one payment method. Reads from
+     * SalePayments (not Sales.payment_method) for the same reason as
+     * paymentBreakdown() above - a split-payment sale would otherwise
+     * dump entirely into an unhelpful "MULTIPLE" bucket instead of
+     * being attributed across the methods actually used.
+     *
+     * The summary total is simply the sum of the breakdown rows, so it
+     * always agrees with what's shown below it - including when a
+     * payment-method filter is active, where the total intentionally
+     * reflects only that method's revenue, not the full sale totals of
+     * every sale that happened to include it as one of several payments.
+     *
+     * @return array{summary: array, breakdown: array}
+     */
+    public function cashierPaymentBreakdown(string $dateFrom, string $dateTo, ?int $cashierId, ?string $paymentMethod): array
+    {
+        $conditions = ["s.status = 'completed'", "s.created_at BETWEEN :date_from AND :date_to"];
+        if ($cashierId !== null) {
+            $conditions[] = "s.user_id = :cashier_id";
+        }
+        if ($paymentMethod !== null) {
+            $conditions[] = "sp.payment_method = :payment_method";
+        }
+
+        $stmt = $this->db->prepare(
+            "SELECT u.user_id AS cashier_id, u.full_name AS cashier_name, sp.payment_method,
+                    COUNT(*) AS transaction_count, SUM(sp.amount) AS revenue
+             FROM SalePayments sp
+             INNER JOIN Sales s ON s.sale_id = sp.sale_id
+             INNER JOIN Users u ON u.user_id = s.user_id
+             WHERE " . implode(' AND ', $conditions) . "
+             GROUP BY u.user_id, u.full_name, sp.payment_method
+             ORDER BY u.full_name ASC, sp.payment_method ASC"
+        );
+        $stmt->bindValue(':date_from', $dateFrom . ' 00:00:00', PDO::PARAM_STR);
+        $stmt->bindValue(':date_to', $dateTo . ' 23:59:59', PDO::PARAM_STR);
+        if ($cashierId !== null) {
+            $stmt->bindValue(':cashier_id', $cashierId, PDO::PARAM_INT);
+        }
+        if ($paymentMethod !== null) {
+            $stmt->bindValue(':payment_method', $paymentMethod, PDO::PARAM_STR);
+        }
+        $stmt->execute();
+
+        $breakdown = array_map(function ($row) {
+            return [
+                'cashier_id'        => (int) $row['cashier_id'],
+                'cashier_name'      => $row['cashier_name'],
+                'payment_method'    => $row['payment_method'],
+                'transaction_count' => (int) $row['transaction_count'],
+                'revenue'           => round((float) $row['revenue'], 2),
+            ];
+        }, $stmt->fetchAll());
+
+        $totalTransactions = array_sum(array_column($breakdown, 'transaction_count'));
+        $totalRevenue = round(array_sum(array_column($breakdown, 'revenue')), 2);
+
+        return [
+            'summary' => [
+                'transaction_count' => $totalTransactions,
+                'revenue'           => $totalRevenue,
+                'average_sale'      => $totalTransactions > 0 ? round($totalRevenue / $totalTransactions, 2) : 0.0,
+            ],
+            'breakdown' => $breakdown,
+        ];
+    }
 }

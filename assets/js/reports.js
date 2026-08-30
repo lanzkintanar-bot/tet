@@ -276,4 +276,115 @@
             });
         });
     });
+    // -------------------------------------------------------------
+    // Cashier x Payment Method report (its own filters, independent of
+    // the date range above)
+    // -------------------------------------------------------------
+
+    function cprToDateInputValue(date) { return date.toISOString().slice(0, 10); }
+
+    function cprApplyPreset(preset) {
+        const today = new Date();
+        let from = new Date(today);
+        const to = new Date(today);
+
+        if (preset === 'yesterday') {
+            from.setDate(today.getDate() - 1);
+            to.setDate(today.getDate() - 1);
+        } else if (preset === 'week') {
+            from.setDate(today.getDate() - today.getDay()); // back to Sunday
+        } else if (preset === 'month') {
+            from = new Date(today.getFullYear(), today.getMonth(), 1);
+        }
+        // 'today' (the default): from/to stay today
+
+        $('#cprDateFrom').val(cprToDateInputValue(from));
+        $('#cprDateTo').val(cprToDateInputValue(to));
+        loadCashierPaymentReport();
+    }
+
+    function cprPopulateCashiers(cashiers) {
+        const $sel = $('#cprCashier');
+        const current = $sel.val();
+        $sel.find('option:not(:first)').remove();
+        cashiers.forEach(function (c) {
+            $sel.append(`<option value="${c.user_id}">${escapeHtml(c.full_name)}</option>`);
+        });
+        // Keep whichever cashier was selected, as long as they still have
+        // sales in the newly-loaded range - otherwise fall back to "All".
+        if (current && $sel.find(`option[value="${current}"]`).length) $sel.val(current);
+    }
+
+    function cprPopulatePaymentMethods(methods) {
+        const $sel = $('#cprPaymentMethod');
+        if ($sel.find('option').length > 1) return; // fixed list - only needs populating once
+        Object.keys(methods).forEach(function (key) {
+            $sel.append(`<option value="${key}">${escapeHtml(methods[key])}</option>`);
+        });
+    }
+
+    function cprRenderBreakdown(rows) {
+        const $body = $('#cprBody').empty();
+        if (!rows.length) {
+            $body.html('<tr><td colspan="4" class="text-center text-muted py-3">No sales in this range.</td></tr>');
+            return;
+        }
+        rows.forEach(function (row) {
+            $body.append(`
+                <tr>
+                    <td>${escapeHtml(row.cashier_name)}</td>
+                    <td><span class="badge pos-badge-muted text-uppercase">${escapeHtml(row.payment_method)}</span></td>
+                    <td class="text-end">${row.transaction_count}</td>
+                    <td class="text-end font-monospace">${money(row.revenue)}</td>
+                </tr>
+            `);
+        });
+    }
+
+    function cprUpdateExportLinks(params) {
+        $('#cprExportExcel').attr('href', ENDPOINT + '?action=export_cashier_payment_excel&' + params).removeClass('disabled');
+        $('#cprExportPdf').attr('href', ENDPOINT + '?action=export_cashier_payment_pdf&' + params).removeClass('disabled');
+    }
+
+    function loadCashierPaymentReport() {
+        const dateFrom = $('#cprDateFrom').val();
+        const dateTo = $('#cprDateTo').val();
+        if (!dateFrom || !dateTo) return;
+
+        const query = {
+            action: 'cashier_payment_breakdown',
+            date_from: dateFrom,
+            date_to: dateTo,
+            cashier_id: $('#cprCashier').val(),
+            payment_method: $('#cprPaymentMethod').val(),
+        };
+
+        $.get(ENDPOINT, query).done(function (res) {
+            if (!res.success) return;
+            cprPopulateCashiers(res.cashiers);
+            cprPopulatePaymentMethods(res.payment_methods);
+            $('#cprStatTransactions').text(res.summary.transaction_count);
+            $('#cprStatRevenue').text(money(res.summary.revenue));
+            $('#cprStatAverage').text(money(res.summary.average_sale));
+            cprRenderBreakdown(res.breakdown);
+            cprUpdateExportLinks($.param(query));
+        });
+    }
+
+    $(function () {
+        if (!$('#cprBody').length) return;
+
+        cprApplyPreset('today');
+
+        $('#cprPresets').on('click', 'button', function () {
+            $('#cprPresets button').removeClass('active');
+            $(this).addClass('active');
+            cprApplyPreset($(this).data('preset'));
+        });
+        $('#cprDateFrom, #cprDateTo').on('change', function () {
+            $('#cprPresets button').removeClass('active');
+            loadCashierPaymentReport();
+        });
+        $('#cprCashier, #cprPaymentMethod').on('change', loadCashierPaymentReport);
+    });
 })(jQuery);
