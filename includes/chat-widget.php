@@ -20,6 +20,7 @@ if (!defined('POS_APP')) {
     <div class="pos-chat-panel-header">
         <button type="button" class="pos-chat-back-btn d-none" id="chatBackBtn" aria-label="Back to conversations"><i class="bi bi-arrow-left"></i></button>
         <span class="pos-chat-panel-title" id="chatPanelTitle">Chat</span>
+        <button type="button" class="pos-chat-icon-btn d-none" id="chatCallBtn" aria-label="Start video call" title="Video call"><i class="bi bi-camera-video-fill"></i></button>
         <button type="button" class="pos-chat-close-btn" id="chatCloseBtn" aria-label="Close chat"><i class="bi bi-x-lg"></i></button>
     </div>
 
@@ -36,6 +37,7 @@ if (!defined('POS_APP')) {
 
     <div class="pos-chat-thread-view d-none" id="chatThreadView">
         <div class="pos-chat-messages" id="chatThreadMessages"></div>
+        <div class="pos-chat-typing-indicator d-none" id="chatTypingIndicator"></div>
         <div class="pos-chat-attachment-preview d-none" id="chatAttachmentPreview">
             <i class="bi bi-paperclip"></i><span id="chatAttachmentName"></span>
             <button type="button" id="chatRemoveAttachment" aria-label="Remove attachment"><i class="bi bi-x"></i></button>
@@ -51,6 +53,36 @@ if (!defined('POS_APP')) {
                 <button type="submit" class="pos-chat-send-btn" id="chatSendBtn" aria-label="Send"><i class="bi bi-send-fill"></i></button>
             </div>
         </form>
-        <emoji-picker class="pos-chat-emoji-picker d-none" id="chatEmojiPicker"></emoji-picker>
+        <emoji-picker
+            class="pos-chat-emoji-picker d-none"
+            id="chatEmojiPicker"
+            data-source="<?= ASSETS_URL ?>/vendor/emoji-picker-element/data/en-data.json"
+        ></emoji-picker>
+    </div>
+</div>
+
+<!-- Incoming video call banner - shown site-wide, independent of whether the chat panel is open -->
+<div class="pos-call-incoming d-none" id="callIncomingBanner">
+    <div class="pos-call-incoming-info">
+        <i class="bi bi-camera-video-fill"></i>
+        <span><span id="callIncomingName">Someone</span> is calling...</span>
+    </div>
+    <div class="pos-call-incoming-actions">
+        <button type="button" class="pos-call-btn decline" id="callDeclineBtn" aria-label="Decline"><i class="bi bi-telephone-x-fill"></i></button>
+        <button type="button" class="pos-call-btn accept" id="callAcceptBtn" aria-label="Accept"><i class="bi bi-telephone-fill"></i></button>
+    </div>
+</div>
+
+<!-- Active call overlay -->
+<div class="pos-call-overlay d-none" id="callOverlay">
+    <div class="pos-call-remote-wrap">
+        <video class="pos-call-remote-video" id="callRemoteVideo" autoplay playsinline></video>
+        <div class="pos-call-status" id="callStatusText"></div>
+        <video class="pos-call-local-video" id="callLocalVideo" autoplay playsinline muted></video>
+    </div>
+    <div class="pos-call-controls">
+        <button type="button" class="pos-call-ctrl-btn active" id="callMuteBtn" aria-label="Mute microphone"><i class="bi bi-mic-fill"></i></button>
+        <button type="button" class="pos-call-ctrl-btn active" id="callCameraBtn" aria-label="Turn camera off"><i class="bi bi-camera-video-fill"></i></button>
+        <button type="button" class="pos-call-ctrl-btn end" id="callHangupBtn" aria-label="End call"><i class="bi bi-telephone-x-fill"></i></button>
     </div>
 </div>

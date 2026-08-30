@@ -148,6 +148,70 @@ if (!defined('POS_APP')) {
     </div>
 </div>
 
+<div class="row g-3 mt-1">
+    <div class="col-12">
+        <div class="card pos-card border-0 shadow-sm">
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+                    <h2 class="h6 mb-0">Cashier &amp; Payment Method Report</h2>
+                    <div class="d-flex gap-2">
+                        <a href="#" class="btn btn-outline-secondary btn-sm disabled" id="cprExportExcel" target="_blank" rel="noopener"><i class="bi bi-file-earmark-excel me-1"></i>Export to Excel</a>
+                        <a href="#" class="btn btn-outline-secondary btn-sm disabled" id="cprExportPdf" target="_blank" rel="noopener"><i class="bi bi-file-earmark-pdf me-1"></i>Export to PDF</a>
+                    </div>
+                </div>
+
+                <div class="d-flex gap-2 flex-wrap align-items-center mb-3">
+                    <select class="form-select form-select-sm pos-select" id="cprCashier" style="max-width: 200px;">
+                        <option value="">All Cashiers</option>
+                    </select>
+                    <select class="form-select form-select-sm pos-select" id="cprPaymentMethod" style="max-width: 170px;">
+                        <option value="">All Payment Methods</option>
+                    </select>
+                    <div class="btn-group btn-group-sm" role="group" id="cprPresets">
+                        <button type="button" class="btn btn-outline-secondary active" data-preset="today">Today</button>
+                        <button type="button" class="btn btn-outline-secondary" data-preset="yesterday">Yesterday</button>
+                        <button type="button" class="btn btn-outline-secondary" data-preset="week">This Week</button>
+                        <button type="button" class="btn btn-outline-secondary" data-preset="month">This Month</button>
+                    </div>
+                    <input type="date" class="form-control form-control-sm pos-select" id="cprDateFrom" style="max-width: 150px;">
+                    <span class="text-muted small">to</span>
+                    <input type="date" class="form-control form-control-sm pos-select" id="cprDateTo" style="max-width: 150px;">
+                </div>
+
+                <div class="row g-3 mb-3">
+                    <div class="col-6 col-md-4">
+                        <div class="card pos-card border-0 bg-body-secondary h-100"><div class="card-body py-2">
+                            <div class="text-muted small mb-1">Transactions</div>
+                            <div class="h5 mb-0" id="cprStatTransactions">0</div>
+                        </div></div>
+                    </div>
+                    <div class="col-6 col-md-4">
+                        <div class="card pos-card border-0 bg-body-secondary h-100"><div class="card-body py-2">
+                            <div class="text-muted small mb-1">Revenue</div>
+                            <div class="h5 mb-0" id="cprStatRevenue">₱0.00</div>
+                        </div></div>
+                    </div>
+                    <div class="col-6 col-md-4">
+                        <div class="card pos-card border-0 bg-body-secondary h-100"><div class="card-body py-2">
+                            <div class="text-muted small mb-1">Average Sale</div>
+                            <div class="h5 mb-0" id="cprStatAverage">₱0.00</div>
+                        </div></div>
+                    </div>
+                </div>
+
+                <div class="table-responsive">
+                    <table class="table pos-table align-middle mb-0">
+                        <thead>
+                            <tr><th>Cashier</th><th>Payment Method</th><th class="text-end">Transactions</th><th class="text-end">Revenue</th></tr>
+                        </thead>
+                        <tbody id="cprBody"><tr><td colspan="4" class="text-center text-muted py-3">Loading...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Add Expense modal -->
 <div class="modal fade" id="expenseModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog">
