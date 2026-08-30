@@ -1,0 +1,984 @@
+From 70e78630ccf0958593b29050efff55861c7c2f1b Mon Sep 17 00:00:00 2001
+From: Claude <assistant@example.com>
+Date: Sat, 29 Aug 2026 18:09:53 +0000
+Subject: [PATCH] Add 1-on-1 video calling to the chat widget
+
+- database/migration_chat_video_calls.sql: dbo.ChatCalls (one row per
+  call attempt, status ringing -> accepted/declined/missed -> ended)
+  and dbo.ChatCallSignals (trickled ICE candidates). Gated separately
+  from the base chat migration so existing installs don't need to run
+  it to keep using chat - only the call_* actions require it.
+- app/models/Chat.php: startCall/getIncomingCalls/getCallStatus/
+  answerCall/declineCall/endCall/addIceCandidate/getIceCandidates.
+  Calls are 1-on-1 only (direct conversations) - a call to everyone in
+  the shared General channel would need real multi-party (mesh/SFU)
+  infrastructure this app doesn't have.
+- app/controllers/ChatController.php: call_start, call_incoming (polled
+  globally every 3s so an incoming call shows up wherever the callee
+  is in the app, not just inside an open thread), call_answer,
+  call_decline, call_end, call_status, call_ice_candidate,
+  call_ice_candidates.
+- assets/js/chat.js: WebRTC calling using a public STUN server
+  (stun.l.google.com) - actual audio/video goes directly between the
+  two browsers once connected, never through this server. A video-call
+  button appears in the header of any direct (1-on-1) thread; an
+  incoming call shows a banner with a simple WebAudio ringtone,
+  Accept/Decline, then a full-screen call overlay with mute/camera
+  toggle and hang up.
+- includes/chat-widget.php, assets/css/style.css: the call button,
+  incoming-call banner, and call overlay markup/styling.
+
+Limitation: only a STUN server is configured, no TURN relay. Two users
+behind restrictive/symmetric NATs (common on some corporate firewalls,
+different mobile carriers, etc.) may fail to connect peer-to-peer
+without one - that needs separate TURN infrastructure (e.g. coturn)
+this app doesn't provide.
+---
+ app/controllers/ChatController.php      | 134 ++++++++++-
+ app/models/Chat.php                     | 268 ++++++++++++++++++++++
+ assets/css/style.css                    |  49 +++++
+ assets/js/chat.js                       | 281 ++++++++++++++++++++++++
+ database/migration_chat_video_calls.sql |  65 ++++++
+ includes/chat-widget.php                |  27 +++
+ 6 files changed, 815 insertions(+), 9 deletions(-)
+ create mode 100644 database/migration_chat_video_calls.sql
+
+diff --git a/app/controllers/ChatController.php b/app/controllers/ChatController.php
+index 9402a54..585a902 100644
+--- a/app/controllers/ChatController.php
++++ b/app/controllers/ChatController.php
+@@ -33,15 +33,34 @@ class ChatController
+             Helper::jsonResponse(false, 'Chat isn\'t set up on this database yet. Ask an administrator to run database/migration_chat.sql.', [], 422);
+         }
+ 
+-        switch ($_REQUEST['action'] ?? '') {
+-            case 'conversations':  $this->conversations(); break;
+-            case 'contacts':       $this->contacts(); break;
+-            case 'open_direct':    $this->openDirect(); break;
+-            case 'messages':       $this->messages(); break;
+-            case 'send':           $this->send(); break;
+-            case 'typing':         $this->typing(); break;
+-            case 'mark_read':      $this->markRead(); break;
+-            case 'unread_count':   $this->unreadCount(); break;
++        $action = $_REQUEST['action'] ?? '';
++
++        // Video-call actions need their own tables, shipped separately
++        // (migration_chat_video_calls.sql) after the base chat migration -
++        // gate them independently so a site that's only run the original
++        // migration gets a clear message instead of a raw SQL error the
++        // first time someone taps the call button.
++        if (strpos($action, 'call_') === 0 && !$this->chatModel->isCallAvailable()) {
++            Helper::jsonResponse(false, 'Video calling isn\'t set up on this database yet. Ask an administrator to run database/migration_chat_video_calls.sql.', [], 422);
++        }
++
++        switch ($action) {
++            case 'conversations':      $this->conversations(); break;
++            case 'contacts':           $this->contacts(); break;
++            case 'open_direct':        $this->openDirect(); break;
++            case 'messages':           $this->messages(); break;
++            case 'send':               $this->send(); break;
++            case 'typing':             $this->typing(); break;
++            case 'mark_read':          $this->markRead(); break;
++            case 'unread_count':       $this->unreadCount(); break;
++            case 'call_start':         $this->callStart(); break;
++            case 'call_incoming':      $this->callIncoming(); break;
++            case 'call_answer':        $this->callAnswer(); break;
++            case 'call_decline':       $this->callDecline(); break;
++            case 'call_end':           $this->callEnd(); break;
++            case 'call_status':        $this->callStatus(); break;
++            case 'call_ice_candidate': $this->callIceCandidate(); break;
++            case 'call_ice_candidates': $this->callIceCandidates(); break;
+             default: Helper::jsonResponse(false, 'Unknown action.', [], 400);
+         }
+     }
+@@ -150,6 +169,103 @@ class ChatController
+     {
+         Helper::jsonResponse(true, '', ['unread_count' => $this->chatModel->totalUnreadCount($this->userId())]);
+     }
++
++    // -------------------------------------------------------------
++    // Video/audio calls (WebRTC signaling - see app/models/Chat.php)
++    // -------------------------------------------------------------
++
++    private const CALL_SDP_MAX_LENGTH = 20000;
++
++    private function callStart(): void
++    {
++        Security::requireValidCsrfFromRequest();
++        $conversationId = (int) ($_POST['conversation_id'] ?? 0);
++        $offer = (string) ($_POST['offer'] ?? '');
++        if ($conversationId <= 0 || $offer === '' || mb_strlen($offer) > self::CALL_SDP_MAX_LENGTH) {
++            Helper::jsonResponse(false, 'Could not start the call.', [], 422);
++        }
++        [$call, $error] = $this->chatModel->startCall($conversationId, $this->userId(), $offer);
++        if ($error) {
++            Helper::jsonResponse(false, $error, [], 422);
++        }
++        Helper::jsonResponse(true, '', $call);
++    }
++
++    /** Polled globally (independent of any open thread) so an incoming call is visible wherever the callee currently is in the app. */
++    private function callIncoming(): void
++    {
++        Helper::jsonResponse(true, '', ['calls' => $this->chatModel->getIncomingCalls($this->userId())]);
++    }
++
++    /** Polled by both sides while a call is ringing/connecting - the caller watches for the answer SDP, both sides watch for a decline/hangup. */
++    private function callStatus(): void
++    {
++        $callId = (int) ($_GET['call_id'] ?? 0);
++        if ($callId <= 0) {
++            Helper::jsonResponse(false, 'Call not found.', [], 404);
++        }
++        [$call, $error] = $this->chatModel->getCallStatus($callId, $this->userId());
++        if ($error) {
++            Helper::jsonResponse(false, $error, [], 404);
++        }
++        Helper::jsonResponse(true, '', ['call' => $call]);
++    }
++
++    private function callAnswer(): void
++    {
++        Security::requireValidCsrfFromRequest();
++        $callId = (int) ($_POST['call_id'] ?? 0);
++        $answer = (string) ($_POST['answer'] ?? '');
++        if ($callId <= 0 || $answer === '' || mb_strlen($answer) > self::CALL_SDP_MAX_LENGTH) {
++            Helper::jsonResponse(false, 'Could not answer the call.', [], 422);
++        }
++        [$call, $error] = $this->chatModel->answerCall($callId, $this->userId(), $answer);
++        if ($error) {
++            Helper::jsonResponse(false, $error, [], 422);
++        }
++        Helper::jsonResponse(true, '', ['call' => $call]);
++    }
++
++    private function callDecline(): void
++    {
++        Security::requireValidCsrfFromRequest();
++        $callId = (int) ($_POST['call_id'] ?? 0);
++        if ($callId > 0) {
++            $this->chatModel->declineCall($callId, $this->userId());
++        }
++        Helper::jsonResponse(true, 'OK.');
++    }
++
++    private function callEnd(): void
++    {
++        Security::requireValidCsrfFromRequest();
++        $callId = (int) ($_POST['call_id'] ?? 0);
++        if ($callId > 0) {
++            $this->chatModel->endCall($callId, $this->userId());
++        }
++        Helper::jsonResponse(true, 'OK.');
++    }
++
++    private function callIceCandidate(): void
++    {
++        Security::requireValidCsrfFromRequest();
++        $callId = (int) ($_POST['call_id'] ?? 0);
++        $candidate = (string) ($_POST['candidate'] ?? '');
++        if ($callId > 0 && $candidate !== '') {
++            $this->chatModel->addIceCandidate($callId, $this->userId(), $candidate);
++        }
++        Helper::jsonResponse(true, 'OK.');
++    }
++
++    private function callIceCandidates(): void
++    {
++        $callId = (int) ($_GET['call_id'] ?? 0);
++        $sinceId = (int) ($_GET['since_id'] ?? 0);
++        if ($callId <= 0) {
++            Helper::jsonResponse(false, 'Call not found.', [], 404);
++        }
++        Helper::jsonResponse(true, '', ['candidates' => $this->chatModel->getIceCandidates($callId, $this->userId(), $sinceId)]);
++    }
+ }
+ 
+ if (basename($_SERVER['SCRIPT_FILENAME']) === basename(__FILE__)) {
+diff --git a/app/models/Chat.php b/app/models/Chat.php
+index 3a74613..7891ea2 100644
+--- a/app/models/Chat.php
++++ b/app/models/Chat.php
+@@ -44,6 +44,22 @@ class Chat
+         return self::$chatTablesAvailable;
+     }
+ 
++    private static ?bool $callTablesAvailable = null;
++
++    /** Separate from isAvailable() so chat keeps working on a DB where migration_chat_video_calls.sql hasn't been run yet - only the call-specific actions need this. */
++    public function isCallAvailable(): bool
++    {
++        if (self::$callTablesAvailable === null) {
++            try {
++                $stmt = $this->db->query("SELECT OBJECT_ID('dbo.ChatCalls', 'U') AS id");
++                self::$callTablesAvailable = !empty($stmt->fetch()['id']);
++            } catch (\Throwable $e) {
++                self::$callTablesAvailable = false;
++            }
++        }
++        return self::$callTablesAvailable;
++    }
++
+     private function generalConversationId(): int
+     {
+         $stmt = $this->db->query("SELECT TOP 1 conversation_id FROM ChatConversations WHERE type = 'general'");
+@@ -408,4 +424,256 @@ class Chat
+             'size' => (int) $file['size'],
+         ], null];
+     }
++
++    // -------------------------------------------------------------
++    // Video/audio calls (1-on-1 only - see migration_chat_video_calls.sql)
++    // -------------------------------------------------------------
++
++    private const CALL_RING_TIMEOUT_SECONDS = 45;
++    private const CALL_SDP_MAX_LENGTH = 20000;
++
++    /** A ringing call nobody answered within CALL_RING_TIMEOUT_SECONDS becomes "missed" - self-healing, no cron job needed since every call read/write opportunistically runs this first. */
++    private function expireStaleRingingCalls(): void
++    {
++        $stmt = $this->db->prepare(
++            "UPDATE ChatCalls SET status = 'missed', ended_at = GETDATE()
++             WHERE status = 'ringing' AND started_at < DATEADD(SECOND, :timeout, GETDATE())"
++        );
++        $stmt->bindValue(':timeout', -self::CALL_RING_TIMEOUT_SECONDS, PDO::PARAM_INT);
++        $stmt->execute();
++    }
++
++    /** @return array{caller_id:int,callee_id:int}|null */
++    private function callParticipants(int $callId): ?array
++    {
++        $stmt = $this->db->prepare("SELECT caller_id, callee_id FROM ChatCalls WHERE call_id = :id");
++        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
++        $stmt->execute();
++        $row = $stmt->fetch();
++        return $row ? ['caller_id' => (int) $row['caller_id'], 'callee_id' => (int) $row['callee_id']] : null;
++    }
++
++    private function formatCall(array $row, int $viewerId): array
++    {
++        return [
++            'call_id' => (int) $row['call_id'],
++            'conversation_id' => (int) $row['conversation_id'],
++            'caller_id' => (int) $row['caller_id'],
++            'callee_id' => (int) $row['callee_id'],
++            'is_caller' => (int) $row['caller_id'] === $viewerId,
++            'status' => $row['status'],
++            'offer_sdp' => $row['offer_sdp'] ?? null,
++            'answer_sdp' => $row['answer_sdp'] ?? null,
++        ];
++    }
++
++    /**
++     * Starts a call from $callerId to whoever else is in $conversationId.
++     * Only valid for 'direct' conversations - a video call to everyone in
++     * 'General' would need real multi-party infrastructure this app
++     * doesn't have.
++     * @return array [call|null, error|null]
++     */
++    public function startCall(int $conversationId, int $callerId, string $offerSdp): array
++    {
++        if (!$this->canAccess($conversationId, $callerId)) {
++            return [null, "You don't have access to this conversation."];
++        }
++        if (mb_strlen($offerSdp) > self::CALL_SDP_MAX_LENGTH) {
++            return [null, 'Could not start the call (invalid session data).'];
++        }
++
++        $convStmt = $this->db->prepare("SELECT type FROM ChatConversations WHERE conversation_id = :id");
++        $convStmt->bindValue(':id', $conversationId, PDO::PARAM_INT);
++        $convStmt->execute();
++        $conversation = $convStmt->fetch();
++        if (!$conversation || $conversation['type'] !== 'direct') {
++            return [null, 'Video calls are only available in direct conversations.'];
++        }
++
++        $otherStmt = $this->db->prepare(
++            "SELECT u.user_id, u.full_name FROM ChatParticipants p
++             INNER JOIN Users u ON u.user_id = p.user_id
++             WHERE p.conversation_id = :cid AND p.user_id != :self"
++        );
++        $otherStmt->bindValue(':cid', $conversationId, PDO::PARAM_INT);
++        $otherStmt->bindValue(':self', $callerId, PDO::PARAM_INT);
++        $otherStmt->execute();
++        $other = $otherStmt->fetch();
++        if (!$other) {
++            return [null, 'The other person in this conversation could not be found.'];
++        }
++        $calleeId = (int) $other['user_id'];
++
++        $this->expireStaleRingingCalls();
++
++        $existingStmt = $this->db->prepare(
++            "SELECT TOP 1 call_id FROM ChatCalls WHERE conversation_id = :cid AND status IN ('ringing', 'accepted')"
++        );
++        $existingStmt->bindValue(':cid', $conversationId, PDO::PARAM_INT);
++        $existingStmt->execute();
++        if ($existingStmt->fetch()) {
++            return [null, 'A call is already in progress in this conversation.'];
++        }
++
++        $stmt = $this->db->prepare(
++            "INSERT INTO ChatCalls (conversation_id, caller_id, callee_id, status, offer_sdp, started_at)
++             OUTPUT INSERTED.call_id
++             VALUES (:cid, :caller, :callee, 'ringing', :offer, GETDATE())"
++        );
++        $stmt->bindValue(':cid', $conversationId, PDO::PARAM_INT);
++        $stmt->bindValue(':caller', $callerId, PDO::PARAM_INT);
++        $stmt->bindValue(':callee', $calleeId, PDO::PARAM_INT);
++        $stmt->bindValue(':offer', $offerSdp, PDO::PARAM_STR);
++        $stmt->execute();
++        $callId = (int) $stmt->fetch()['call_id'];
++
++        return [[
++            'call_id' => $callId,
++            'callee_id' => $calleeId,
++            'callee_name' => $other['full_name'],
++        ], null];
++    }
++
++    /** Ringing calls for $userId to answer - polled globally (chat panel open or not) so an incoming call is never missed just because the widget happens to be closed. */
++    public function getIncomingCalls(int $userId): array
++    {
++        $this->expireStaleRingingCalls();
++
++        $stmt = $this->db->prepare(
++            "SELECT c.call_id, c.conversation_id, c.caller_id, u.full_name AS caller_name, c.offer_sdp
++             FROM ChatCalls c
++             INNER JOIN Users u ON u.user_id = c.caller_id
++             WHERE c.callee_id = :uid AND c.status = 'ringing'
++             ORDER BY c.started_at DESC"
++        );
++        $stmt->bindValue(':uid', $userId, PDO::PARAM_INT);
++        $stmt->execute();
++        $rows = $stmt->fetchAll();
++        foreach ($rows as &$row) {
++            $row['call_id'] = (int) $row['call_id'];
++            $row['conversation_id'] = (int) $row['conversation_id'];
++            $row['caller_id'] = (int) $row['caller_id'];
++        }
++        unset($row);
++        return $rows;
++    }
++
++    /**
++     * Called by both sides while a call is ringing/connecting/active - the
++     * caller uses it to notice the answer SDP the moment the callee picks
++     * up, and both sides use it to notice a decline/hangup on the other end.
++     * @return array [call|null, error|null]
++     */
++    public function getCallStatus(int $callId, int $userId): array
++    {
++        $this->expireStaleRingingCalls();
++
++        $participants = $this->callParticipants($callId);
++        if (!$participants || !in_array($userId, [$participants['caller_id'], $participants['callee_id']], true)) {
++            return [null, 'Call not found.'];
++        }
++
++        $stmt = $this->db->prepare("SELECT * FROM ChatCalls WHERE call_id = :id");
++        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
++        $stmt->execute();
++        $row = $stmt->fetch();
++        return [$this->formatCall($row, $userId), null];
++    }
++
++    /** @return array [call|null, error|null] */
++    public function answerCall(int $callId, int $userId, string $answerSdp): array
++    {
++        if (mb_strlen($answerSdp) > self::CALL_SDP_MAX_LENGTH) {
++            return [null, 'Could not answer the call (invalid session data).'];
++        }
++        $this->expireStaleRingingCalls();
++
++        $participants = $this->callParticipants($callId);
++        if (!$participants || $participants['callee_id'] !== $userId) {
++            return [null, 'Call not found.'];
++        }
++
++        $stmt = $this->db->prepare(
++            "UPDATE ChatCalls SET status = 'accepted', answer_sdp = :answer, answered_at = GETDATE()
++             WHERE call_id = :id AND status = 'ringing'"
++        );
++        $stmt->bindValue(':answer', $answerSdp, PDO::PARAM_STR);
++        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
++        $stmt->execute();
++        if ($stmt->rowCount() === 0) {
++            return [null, 'This call is no longer available.'];
++        }
++
++        return $this->getCallStatus($callId, $userId);
++    }
++
++    public function declineCall(int $callId, int $userId): void
++    {
++        $participants = $this->callParticipants($callId);
++        if (!$participants || $participants['callee_id'] !== $userId) {
++            return;
++        }
++        $stmt = $this->db->prepare(
++            "UPDATE ChatCalls SET status = 'declined', ended_at = GETDATE(), ended_by = :uid
++             WHERE call_id = :id AND status = 'ringing'"
++        );
++        $stmt->bindValue(':uid', $userId, PDO::PARAM_INT);
++        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
++        $stmt->execute();
++    }
++
++    /** Either side can hang up, whether the call is still ringing (cancel) or already connected. */
++    public function endCall(int $callId, int $userId): void
++    {
++        $participants = $this->callParticipants($callId);
++        if (!$participants || !in_array($userId, [$participants['caller_id'], $participants['callee_id']], true)) {
++            return;
++        }
++        $stmt = $this->db->prepare(
++            "UPDATE ChatCalls SET status = 'ended', ended_at = GETDATE(), ended_by = :uid
++             WHERE call_id = :id AND status IN ('ringing', 'accepted')"
++        );
++        $stmt->bindValue(':uid', $userId, PDO::PARAM_INT);
++        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
++        $stmt->execute();
++    }
++
++    /** Trickled ICE candidate from $userId's side of $callId, for the other side to pick up via getIceCandidates(). */
++    public function addIceCandidate(int $callId, int $userId, string $candidateJson): void
++    {
++        if (mb_strlen($candidateJson) > self::CALL_SDP_MAX_LENGTH) {
++            return;
++        }
++        $participants = $this->callParticipants($callId);
++        if (!$participants || !in_array($userId, [$participants['caller_id'], $participants['callee_id']], true)) {
++            return;
++        }
++        $stmt = $this->db->prepare(
++            "INSERT INTO ChatCallSignals (call_id, sender_id, candidate, created_at) VALUES (:cid, :uid, :candidate, GETDATE())"
++        );
++        $stmt->bindValue(':cid', $callId, PDO::PARAM_INT);
++        $stmt->bindValue(':uid', $userId, PDO::PARAM_INT);
++        $stmt->bindValue(':candidate', $candidateJson, PDO::PARAM_STR);
++        $stmt->execute();
++    }
++
++    /** ICE candidates from the OTHER side of $callId since $sinceId - each side only ever needs the ones it didn't send itself. */
++    public function getIceCandidates(int $callId, int $userId, int $sinceId): array
++    {
++        $participants = $this->callParticipants($callId);
++        if (!$participants || !in_array($userId, [$participants['caller_id'], $participants['callee_id']], true)) {
++            return [];
++        }
++        $stmt = $this->db->prepare(
++            "SELECT signal_id, candidate FROM ChatCallSignals
++             WHERE call_id = :cid AND sender_id != :self AND signal_id > :since
++             ORDER BY signal_id ASC"
++        );
++        $stmt->bindValue(':cid', $callId, PDO::PARAM_INT);
++        $stmt->bindValue(':self', $userId, PDO::PARAM_INT);
++        $stmt->bindValue(':since', $sinceId, PDO::PARAM_INT);
++        $stmt->execute();
++        return $stmt->fetchAll();
++    }
+ }
+diff --git a/assets/css/style.css b/assets/css/style.css
+index c2e5521..2a9f83e 100644
+--- a/assets/css/style.css
++++ b/assets/css/style.css
+@@ -1032,6 +1032,55 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: var(--pos-border
+ .pos-chat-bubble-row.theirs .pos-chat-bubble { background: var(--pos-bg); color: var(--pos-ink); border-bottom-left-radius: 4px; }
+ .pos-chat-bubble-time { font-size: .62rem; color: var(--pos-muted); margin-top: 2px; padding: 0 2px; }
+ .pos-chat-typing-indicator { font-size: .72rem; color: var(--pos-muted); font-style: italic; padding: 0 12px 4px; }
++
++/* ---- Video calling ---- */
++.pos-call-incoming {
++    position: fixed; top: 16px; right: 16px; z-index: 1080;
++    display: flex; align-items: center; gap: 14px;
++    background: var(--pos-ink-2, #1f2937); color: #fff;
++    padding: 12px 14px; border-radius: 12px;
++    box-shadow: 0 10px 28px rgba(0,0,0,.28);
++    max-width: min(360px, calc(100vw - 32px));
++}
++.pos-call-incoming-info { display: flex; align-items: center; gap: 8px; font-size: .85rem; flex: 1; min-width: 0; }
++.pos-call-incoming-info i { color: #4ade80; font-size: 1.1rem; }
++.pos-call-incoming-actions { display: flex; gap: 8px; flex-shrink: 0; }
++.pos-call-btn {
++    width: 38px; height: 38px; border-radius: 50%; border: none;
++    display: inline-flex; align-items: center; justify-content: center; font-size: 1rem; color: #fff;
++}
++.pos-call-btn.accept { background: #22c55e; }
++.pos-call-btn.decline { background: #ef4444; }
++
++.pos-call-overlay {
++    position: fixed; inset: 0; z-index: 1090; background: #0b0f14;
++    display: flex; flex-direction: column;
++}
++.pos-call-remote-wrap { position: relative; flex: 1; min-height: 0; }
++.pos-call-remote-video { width: 100%; height: 100%; object-fit: contain; background: #0b0f14; }
++.pos-call-local-video {
++    position: absolute; bottom: 16px; right: 16px; width: 130px; height: 174px;
++    object-fit: cover; border-radius: 10px; border: 2px solid rgba(255,255,255,.25);
++    background: #111; transform: scaleX(-1); /* mirror, like a selfie camera */
++}
++.pos-call-status {
++    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
++    color: rgba(255,255,255,.85); font-size: 1rem; text-align: center;
++}
++.pos-call-controls {
++    display: flex; justify-content: center; gap: 16px; padding: 16px;
++    background: rgba(255,255,255,.04);
++}
++.pos-call-ctrl-btn {
++    width: 52px; height: 52px; border-radius: 50%; border: none;
++    background: rgba(255,255,255,.14); color: #fff; font-size: 1.15rem;
++    display: inline-flex; align-items: center; justify-content: center;
++}
++.pos-call-ctrl-btn.active { background: rgba(255,255,255,.35); }
++.pos-call-ctrl-btn.end { background: #ef4444; }
++@media (max-width: 575.98px) {
++    .pos-call-local-video { width: 96px; height: 128px; }
++}
+ .pos-chat-bubble-image { max-width: 100%; border-radius: 10px; display: block; margin-top: 4px; cursor: pointer; }
+ .pos-chat-bubble-file {
+   display: flex; align-items: center; gap: 6px; margin-top: 4px; padding: 6px 10px; border-radius: 8px;
+diff --git a/assets/js/chat.js b/assets/js/chat.js
+index 894bc56..a8f17ec 100644
+--- a/assets/js/chat.js
++++ b/assets/js/chat.js
+@@ -13,6 +13,9 @@
+     const ENDPOINT = (window.APP_URL || '') + '/app/controllers/ChatController.php';
+     const UNREAD_POLL_MS = 20000;   // badge on the floating button, always running
+     const THREAD_POLL_MS = 4000;    // new messages in whatever thread is currently open
++    const INCOMING_CALL_POLL_MS = 3000; // global "is anyone calling me" check
++    const CALL_PROGRESS_POLL_MS = 1200; // fast poll while a call is ringing/connecting/active
++    const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
+ 
+     let unreadTimer = null;
+     let threadTimer = null;
+@@ -23,6 +26,20 @@
+     let lastTypingPingAt = 0;
+     let chatAvailable = true; // flips false on the first "migration not run" response so we stop polling instead of erroring forever
+ 
++    // Video calling
++    let incomingCallTimer = null;
++    let callProgressTimer = null;
++    let callAvailable = true; // flips false if the video-call migration hasn't been run
++    let pc = null;
++    let localStream = null;
++    let activeCallId = null;
++    let activeCallRole = null; // 'caller' | 'callee'
++    let iceSinceId = 0;
++    let pendingLocalCandidates = [];
++    let currentIncomingCall = null; // the call object currently shown on the incoming-call banner
++    let ringtoneCtx = null;
++    let ringtoneInterval = null;
++
+     function escapeHtml(str) { return $('<div>').text(str == null ? '' : str).html(); }
+ 
+     function initials(name) {
+@@ -177,6 +194,7 @@
+         $('#chatListView').addClass('d-none');
+         $('#chatThreadView').removeClass('d-none');
+         $('#chatBackBtn').removeClass('d-none');
++        $('#chatCallBtn').toggleClass('d-none', activeConversationType !== 'direct');
+         if (title) $('#chatPanelTitle').text(title);
+         $('#chatThreadMessages').html('<div class="text-center text-muted small py-4">Loading...</div>');
+         renderTyping(null);
+@@ -195,6 +213,7 @@
+         $('#chatThreadView').addClass('d-none');
+         $('#chatListView').removeClass('d-none');
+         $('#chatBackBtn').addClass('d-none');
++        $('#chatCallBtn').addClass('d-none');
+         $('#chatPanelTitle').text('Chat');
+         loadConversations();
+     }
+@@ -289,6 +308,244 @@
+             .always(function () { $sendBtn.prop('disabled', false); });
+     }
+ 
++    // -------------------------------------------------------------
++    // Video calling (WebRTC, signaled by polling the endpoints above -
++    // audio/video itself flows directly between the two browsers once
++    // connected, never through this server)
++    // -------------------------------------------------------------
++
++    function ringtoneStart() {
++        ringtoneStop();
++        try {
++            const Ctx = window.AudioContext || window.webkitAudioContext;
++            if (!Ctx) return;
++            ringtoneCtx = new Ctx();
++            const beep = function () {
++                if (!ringtoneCtx) return;
++                const osc = ringtoneCtx.createOscillator();
++                const gain = ringtoneCtx.createGain();
++                osc.frequency.value = 880;
++                gain.gain.setValueAtTime(0.15, ringtoneCtx.currentTime);
++                osc.connect(gain).connect(ringtoneCtx.destination);
++                osc.start();
++                osc.stop(ringtoneCtx.currentTime + 0.25);
++            };
++            beep();
++            ringtoneInterval = setInterval(beep, 1500);
++        } catch (e) { /* audio isn't essential to the feature - fail silently */ }
++    }
++
++    function ringtoneStop() {
++        clearInterval(ringtoneInterval);
++        ringtoneInterval = null;
++        if (ringtoneCtx) {
++            try { ringtoneCtx.close(); } catch (e) { /* ignore */ }
++            ringtoneCtx = null;
++        }
++    }
++
++    function showIncomingCallBanner(call) {
++        currentIncomingCall = call;
++        $('#callIncomingName').text(call.caller_name);
++        $('#callIncomingBanner').removeClass('d-none');
++        ringtoneStart();
++    }
++
++    function hideIncomingCallBanner() {
++        currentIncomingCall = null;
++        $('#callIncomingBanner').addClass('d-none');
++        ringtoneStop();
++    }
++
++    function pollIncomingCalls() {
++        if (!callAvailable || activeCallId) return;
++        $.get(ENDPOINT, { action: 'call_incoming' })
++            .done(function (res) {
++                if (!res.success) { callAvailable = false; return; }
++                const call = (res.calls || [])[0];
++                if (!call) {
++                    if (currentIncomingCall) hideIncomingCallBanner();
++                    return;
++                }
++                if (currentIncomingCall && currentIncomingCall.call_id === call.call_id) return;
++                showIncomingCallBanner(call);
++            })
++            .fail(function (jq) { if (jq.status === 422) callAvailable = false; });
++    }
++
++    function setCallStatusText(text) {
++        $('#callStatusText').text(text || '').toggleClass('d-none', !text);
++    }
++
++    function sendIceCandidate(candidate) {
++        if (!activeCallId) return;
++        $.ajax({ url: ENDPOINT, method: 'POST', dataType: 'json', data: { action: 'call_ice_candidate', call_id: activeCallId, candidate: JSON.stringify(candidate) } });
++    }
++
++    function createPeerConnection() {
++        const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS });
++        conn.ontrack = function (e) {
++            const remoteVideo = document.getElementById('callRemoteVideo');
++            if (remoteVideo && remoteVideo.srcObject !== e.streams[0]) remoteVideo.srcObject = e.streams[0];
++        };
++        conn.onicecandidate = function (e) {
++            if (!e.candidate) return;
++            if (activeCallId) sendIceCandidate(e.candidate);
++            else pendingLocalCandidates.push(e.candidate);
++        };
++        return conn;
++    }
++
++    function openCallOverlay(initialStatus) {
++        $('#callOverlay').removeClass('d-none');
++        $('#callMuteBtn, #callCameraBtn').addClass('active');
++        setCallStatusText(initialStatus);
++    }
++
++    function endCallCleanup() {
++        clearInterval(callProgressTimer);
++        callProgressTimer = null;
++        if (pc) { try { pc.close(); } catch (e) { /* ignore */ } pc = null; }
++        if (localStream) { localStream.getTracks().forEach(function (t) { t.stop(); }); localStream = null; }
++        activeCallId = null;
++        activeCallRole = null;
++        iceSinceId = 0;
++        pendingLocalCandidates = [];
++        $('#callOverlay').addClass('d-none');
++        const remoteVideo = document.getElementById('callRemoteVideo');
++        const localVideo = document.getElementById('callLocalVideo');
++        if (remoteVideo) remoteVideo.srcObject = null;
++        if (localVideo) localVideo.srcObject = null;
++    }
++
++    function pollCallProgress() {
++        if (!activeCallId) return;
++        const callId = activeCallId;
++
++        $.get(ENDPOINT, { action: 'call_ice_candidates', call_id: callId, since_id: iceSinceId }).done(function (res) {
++            if (!res.success || callId !== activeCallId) return;
++            (res.candidates || []).forEach(function (c) {
++                iceSinceId = Math.max(iceSinceId, c.signal_id);
++                try { pc && pc.addIceCandidate(new RTCIceCandidate(JSON.parse(c.candidate))); } catch (e) { /* ignore a stray bad candidate */ }
++            });
++        });
++
++        $.get(ENDPOINT, { action: 'call_status', call_id: callId }).done(function (res) {
++            if (callId !== activeCallId) return;
++            const call = res.success ? res.call : null;
++            if (!call) { setCallStatusText('Call ended.'); setTimeout(endCallCleanup, 1000); return; }
++
++            if (activeCallRole === 'caller' && call.status === 'accepted' && call.answer_sdp && pc && !pc.currentRemoteDescription) {
++                pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(call.answer_sdp)))
++                    .then(function () { setCallStatusText(''); })
++                    .catch(function () { /* ignore - a late/duplicate answer isn't fatal */ });
++            }
++            if (call.status === 'declined') { setCallStatusText('Call declined.'); setTimeout(endCallCleanup, 1200); }
++            else if (call.status === 'missed') { setCallStatusText('No answer.'); setTimeout(endCallCleanup, 1200); }
++            else if (call.status === 'ended') { setCallStatusText('Call ended.'); setTimeout(endCallCleanup, 1000); }
++        });
++    }
++
++    function startCallPolling() {
++        clearInterval(callProgressTimer);
++        callProgressTimer = setInterval(pollCallProgress, CALL_PROGRESS_POLL_MS);
++    }
++
++    function startCall() {
++        if (!activeConversationId || activeConversationType !== 'direct') return;
++        if (activeCallId) { alert('You\'re already on a call.'); return; }
++        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
++            alert('Video calling needs camera/microphone access, which this browser or connection does not allow (HTTPS is required).');
++            return;
++        }
++
++        navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then(function (stream) {
++            localStream = stream;
++            const conversationId = activeConversationId;
++            openCallOverlay('Calling...');
++            document.getElementById('callLocalVideo').srcObject = localStream;
++
++            pc = createPeerConnection();
++            localStream.getTracks().forEach(function (track) { pc.addTrack(track, localStream); });
++
++            return pc.createOffer().then(function (offer) {
++                return pc.setLocalDescription(offer).then(function () { return offer; });
++            }).then(function (offer) {
++                return $.ajax({
++                    url: ENDPOINT, method: 'POST', dataType: 'json',
++                    data: { action: 'call_start', conversation_id: conversationId, offer: JSON.stringify(offer) },
++                });
++            });
++        }).then(function (res) {
++            if (!res.success) { alert(res.message || 'Could not start the call.'); endCallCleanup(); return; }
++            activeCallId = res.call_id;
++            activeCallRole = 'caller';
++            iceSinceId = 0;
++            pendingLocalCandidates.forEach(sendIceCandidate);
++            pendingLocalCandidates = [];
++            setCallStatusText('Calling ' + (res.callee_name || '') + '...');
++            startCallPolling();
++        }).catch(function (err) {
++            if (err && err.responseJSON) { alert(err.responseJSON.message || 'Could not start the call.'); }
++            else { alert('Could not access the camera/microphone. Check permissions and try again.'); }
++            endCallCleanup();
++        });
++    }
++
++    function acceptIncomingCall() {
++        const call = currentIncomingCall;
++        if (!call) return;
++        hideIncomingCallBanner();
++
++        navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then(function (stream) {
++            localStream = stream;
++            openCallOverlay('Connecting...');
++            document.getElementById('callLocalVideo').srcObject = localStream;
++
++            pc = createPeerConnection();
++            localStream.getTracks().forEach(function (track) { pc.addTrack(track, localStream); });
++
++            return pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(call.offer_sdp)))
++                .then(function () { return pc.createAnswer(); })
++                .then(function (answer) { return pc.setLocalDescription(answer).then(function () { return answer; }); })
++                .then(function (answer) {
++                    activeCallId = call.call_id;
++                    activeCallRole = 'callee';
++                    iceSinceId = 0;
++                    pendingLocalCandidates.forEach(sendIceCandidate);
++                    pendingLocalCandidates = [];
++                    return $.ajax({
++                        url: ENDPOINT, method: 'POST', dataType: 'json',
++                        data: { action: 'call_answer', call_id: call.call_id, answer: JSON.stringify(answer) },
++                    });
++                });
++        }).then(function (res) {
++            if (!res.success) { alert(res.message || 'Could not answer the call.'); endCallCleanup(); return; }
++            setCallStatusText('');
++            startCallPolling();
++        }).catch(function (err) {
++            if (err && err.responseJSON) { alert(err.responseJSON.message || 'Could not answer the call.'); }
++            else { alert('Could not access the camera/microphone. Check permissions and try again.'); }
++            $.ajax({ url: ENDPOINT, method: 'POST', dataType: 'json', data: { action: 'call_decline', call_id: call.call_id } });
++            endCallCleanup();
++        });
++    }
++
++    function declineIncomingCall() {
++        const call = currentIncomingCall;
++        hideIncomingCallBanner();
++        if (call) {
++            $.ajax({ url: ENDPOINT, method: 'POST', dataType: 'json', data: { action: 'call_decline', call_id: call.call_id } });
++        }
++    }
++
++    function hangUpCall() {
++        if (activeCallId) {
++            $.ajax({ url: ENDPOINT, method: 'POST', dataType: 'json', data: { action: 'call_end', call_id: activeCallId } });
++        }
++        endCallCleanup();
++    }
++
+     // -------------------------------------------------------------
+     // Wiring
+     // -------------------------------------------------------------
+@@ -296,6 +553,30 @@
+         pollUnread();
+         unreadTimer = setInterval(pollUnread, UNREAD_POLL_MS);
+ 
++        pollIncomingCalls();
++        incomingCallTimer = setInterval(pollIncomingCalls, INCOMING_CALL_POLL_MS);
++
++        $('#chatCallBtn').on('click', startCall);
++        $('#callAcceptBtn').on('click', acceptIncomingCall);
++        $('#callDeclineBtn').on('click', declineIncomingCall);
++        $('#callHangupBtn').on('click', hangUpCall);
++        $('#callMuteBtn').on('click', function () {
++            if (!localStream) return;
++            localStream.getAudioTracks().forEach(function (t) { t.enabled = !t.enabled; });
++            $(this).toggleClass('active', !!(localStream.getAudioTracks()[0] && localStream.getAudioTracks()[0].enabled));
++        });
++        $('#callCameraBtn').on('click', function () {
++            if (!localStream) return;
++            localStream.getVideoTracks().forEach(function (t) { t.enabled = !t.enabled; });
++            $(this).toggleClass('active', !!(localStream.getVideoTracks()[0] && localStream.getVideoTracks()[0].enabled));
++        });
++        window.addEventListener('beforeunload', function () {
++            if (activeCallId && navigator.sendBeacon) {
++                const csrf = $('meta[name="csrf-token"]').attr('content') || '';
++                navigator.sendBeacon(ENDPOINT, new URLSearchParams({ action: 'call_end', call_id: activeCallId, csrf_token: csrf }));
++            }
++        });
++
+         $('#chatWidgetToggle').on('click', function () {
+             const $panel = $('#chatPanel');
+             const opening = $panel.hasClass('d-none');
+diff --git a/database/migration_chat_video_calls.sql b/database/migration_chat_video_calls.sql
+new file mode 100644
+index 0000000..838b6c4
+--- /dev/null
++++ b/database/migration_chat_video_calls.sql
+@@ -0,0 +1,65 @@
++/* =========================================================================
++   database/migration_chat_video_calls.sql
++   -------------------------------------------------------------------------
++   Adds 1-on-1 video/audio calling to the chat widget, on top of the
++   existing dbo.ChatConversations / dbo.ChatParticipants tables (see
++   migration_chat.sql). Scoped to 'direct' conversations only - a video
++   call between everyone in the shared 'General' channel would need
++   real multi-party (mesh/SFU) infrastructure, not just this.
++
++     1. dbo.ChatCalls - one row per call attempt. caller_id rings
++        callee_id; status moves ringing -> accepted/declined/missed,
++        then -> ended. offer_sdp/answer_sdp hold the WebRTC session
++        descriptions exchanged during setup (see app/models/Chat.php
++        startCall()/answerCall()).
++     2. dbo.ChatCallSignals - trickled ICE candidates exchanged while a
++        call is connecting. Short-lived: rows are only ever read by the
++        other side of that specific call and cascade-delete with it.
++
++   Actual audio/video never touches this server - it flows directly
++   between the two browsers (WebRTC), using a public STUN server to
++   discover each side's reachable address. This DOES NOT include a TURN
++   server: on networks with restrictive/symmetric NAT (common behind
++   some corporate firewalls) a direct connection can fail to establish
++   even though signaling succeeds - that needs a TURN relay, which is
++   infrastructure outside of what this app can provide on its own.
++
++   Safe to re-run - only adds what's missing.
++   ========================================================================= */
++
++IF OBJECT_ID('dbo.ChatCalls', 'U') IS NULL
++CREATE TABLE dbo.ChatCalls (
++    call_id         INT IDENTITY(1,1) PRIMARY KEY,
++    conversation_id INT NOT NULL,
++    caller_id       INT NOT NULL,
++    callee_id       INT NOT NULL,
++    status          NVARCHAR(20) NOT NULL DEFAULT 'ringing', -- ringing | accepted | declined | missed | ended
++    offer_sdp       NVARCHAR(MAX) NULL,
++    answer_sdp      NVARCHAR(MAX) NULL,
++    started_at      DATETIME NOT NULL DEFAULT GETDATE(),
++    answered_at     DATETIME NULL,
++    ended_at        DATETIME NULL,
++    ended_by        INT NULL,
++    CONSTRAINT FK_ChatCalls_Conversation FOREIGN KEY (conversation_id) REFERENCES dbo.ChatConversations(conversation_id) ON DELETE CASCADE,
++    CONSTRAINT FK_ChatCalls_Caller FOREIGN KEY (caller_id) REFERENCES dbo.Users(user_id),
++    CONSTRAINT FK_ChatCalls_Callee FOREIGN KEY (callee_id) REFERENCES dbo.Users(user_id)
++);
++GO
++
++IF OBJECT_ID('dbo.ChatCallSignals', 'U') IS NULL
++CREATE TABLE dbo.ChatCallSignals (
++    signal_id  INT IDENTITY(1,1) PRIMARY KEY,
++    call_id    INT NOT NULL,
++    sender_id  INT NOT NULL,
++    candidate  NVARCHAR(MAX) NOT NULL,
++    created_at DATETIME NOT NULL DEFAULT GETDATE(),
++    CONSTRAINT FK_ChatCallSignals_Call FOREIGN KEY (call_id) REFERENCES dbo.ChatCalls(call_id) ON DELETE CASCADE
++);
++GO
++
++IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ChatCalls_Callee_Status')
++CREATE INDEX IX_ChatCalls_Callee_Status ON dbo.ChatCalls(callee_id, status);
++GO
++IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ChatCallSignals_Call')
++CREATE INDEX IX_ChatCallSignals_Call ON dbo.ChatCallSignals(call_id, signal_id);
++GO
+diff --git a/includes/chat-widget.php b/includes/chat-widget.php
+index e07b16b..7dd95fd 100644
+--- a/includes/chat-widget.php
++++ b/includes/chat-widget.php
+@@ -20,6 +20,7 @@ if (!defined('POS_APP')) {
+     <div class="pos-chat-panel-header">
+         <button type="button" class="pos-chat-back-btn d-none" id="chatBackBtn" aria-label="Back to conversations"><i class="bi bi-arrow-left"></i></button>
+         <span class="pos-chat-panel-title" id="chatPanelTitle">Chat</span>
++        <button type="button" class="pos-chat-icon-btn d-none" id="chatCallBtn" aria-label="Start video call" title="Video call"><i class="bi bi-camera-video-fill"></i></button>
+         <button type="button" class="pos-chat-close-btn" id="chatCloseBtn" aria-label="Close chat"><i class="bi bi-x-lg"></i></button>
+     </div>
+ 
+@@ -59,3 +60,29 @@ if (!defined('POS_APP')) {
+         ></emoji-picker>
+     </div>
+ </div>
++
++<!-- Incoming video call banner - shown site-wide, independent of whether the chat panel is open -->
++<div class="pos-call-incoming d-none" id="callIncomingBanner">
++    <div class="pos-call-incoming-info">
++        <i class="bi bi-camera-video-fill"></i>
++        <span><span id="callIncomingName">Someone</span> is calling...</span>
++    </div>
++    <div class="pos-call-incoming-actions">
++        <button type="button" class="pos-call-btn decline" id="callDeclineBtn" aria-label="Decline"><i class="bi bi-telephone-x-fill"></i></button>
++        <button type="button" class="pos-call-btn accept" id="callAcceptBtn" aria-label="Accept"><i class="bi bi-telephone-fill"></i></button>
++    </div>
++</div>
++
++<!-- Active call overlay -->
++<div class="pos-call-overlay d-none" id="callOverlay">
++    <div class="pos-call-remote-wrap">
++        <video class="pos-call-remote-video" id="callRemoteVideo" autoplay playsinline></video>
++        <div class="pos-call-status" id="callStatusText"></div>
++        <video class="pos-call-local-video" id="callLocalVideo" autoplay playsinline muted></video>
++    </div>
++    <div class="pos-call-controls">
++        <button type="button" class="pos-call-ctrl-btn active" id="callMuteBtn" aria-label="Mute microphone"><i class="bi bi-mic-fill"></i></button>
++        <button type="button" class="pos-call-ctrl-btn active" id="callCameraBtn" aria-label="Turn camera off"><i class="bi bi-camera-video-fill"></i></button>
++        <button type="button" class="pos-call-ctrl-btn end" id="callHangupBtn" aria-label="End call"><i class="bi bi-telephone-x-fill"></i></button>
++    </div>
++</div>
+-- 
+2.43.0
+

@@ -9,6 +9,7 @@ SessionManager::requirePermission('pos.access');
 
 $pageTitle = 'POS Screen';
 $csrfToken = Security::generateCsrfToken();
+$hideChatWidget = true; // Keep the floating chat button/panel off the POS screen only - see includes/footer.php
 ?>
 <!DOCTYPE html>
 <html lang="en">

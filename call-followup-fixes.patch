@@ -1,0 +1,226 @@
+From 9dc1c90ec09899dad3c3e3d84e565215c81b9a8d Mon Sep 17 00:00:00 2001
+From: Claude <assistant@example.com>
+Date: Sat, 29 Aug 2026 23:05:26 +0000
+Subject: [PATCH] Fix stuck 'call already in progress', chat panel showing
+ behind a call, and missing ringback tone
+
+1. 'A call is already in progress in this conversation' getting stuck
+   permanently: an 'accepted' call had no way to expire on its own if
+   one side disconnected without a clean hangup (closed tab, lost
+   network, phone locked, browser crash - beforeunload/sendBeacon
+   doesn't fire reliably in any of those). Added
+   database/migration_chat_calls_activity.sql (ChatCalls.last_activity_at)
+   - refreshed for free every time either side polls call_status or
+     call_ice_candidates (already happening every ~1.2s while a call is
+     up), and an 'accepted' call nobody has polled in 20s is now
+     force-closed the next time any call action runs the existing
+     stale-call sweep.
+
+2. Chat messages/panel showing behind the call screen: .pos-chat-panel
+   and .pos-chat-toggle were z-index 1091, one point HIGHER than
+   .pos-call-overlay's 1090, so the open chat panel rendered on top of
+   the call. Raised the call overlay/incoming-call banner above both,
+   and belt-and-suspenders: the chat panel and floating toggle button
+   are now explicitly hidden while a call is active and restored after
+   (only if the panel was actually open before the call started).
+
+3. No ringtone for the caller while ringing (only the callee's incoming
+   banner had one) - added a ringback tone that starts the moment the
+   call starts ringing and stops as soon as the status changes (answered,
+   declined, missed, or ended).
+---
+ app/models/Chat.php                        | 36 ++++++++++++++++++++--
+ assets/css/style.css                       |  4 +--
+ assets/js/chat.js                          | 17 ++++++++++
+ database/migration_chat_calls_activity.sql | 26 ++++++++++++++++
+ 4 files changed, 78 insertions(+), 5 deletions(-)
+ create mode 100644 database/migration_chat_calls_activity.sql
+
+diff --git a/app/models/Chat.php b/app/models/Chat.php
+index 7891ea2..436a50d 100644
+--- a/app/models/Chat.php
++++ b/app/models/Chat.php
+@@ -430,16 +430,43 @@ class Chat
+     // -------------------------------------------------------------
+ 
+     private const CALL_RING_TIMEOUT_SECONDS = 45;
++    private const CALL_STALE_ACTIVE_SECONDS = 20; // how long an 'accepted' call can go unpolled by either side before it's assumed abandoned
+     private const CALL_SDP_MAX_LENGTH = 20000;
+ 
+-    /** A ringing call nobody answered within CALL_RING_TIMEOUT_SECONDS becomes "missed" - self-healing, no cron job needed since every call read/write opportunistically runs this first. */
++    /**
++     * Self-healing cleanup, run at the top of every call read/write - no
++     * cron job needed:
++     *   - a 'ringing' call nobody answered in time becomes 'missed'.
++     *   - an 'accepted' call neither side has polled recently (see
++     *     touchCallActivity()) is assumed abandoned - e.g. a tab closed,
++     *     the network dropped, or the browser crashed without a clean
++     *     hangup - and gets force-closed so it stops blocking new calls
++     *     in that conversation.
++     */
+     private function expireStaleRingingCalls(): void
+     {
+         $stmt = $this->db->prepare(
+             "UPDATE ChatCalls SET status = 'missed', ended_at = GETDATE()
+-             WHERE status = 'ringing' AND started_at < DATEADD(SECOND, :timeout, GETDATE())"
++             WHERE status = 'ringing' AND started_at < DATEADD(SECOND, :ringTimeout, GETDATE())"
++        );
++        $stmt->bindValue(':ringTimeout', -self::CALL_RING_TIMEOUT_SECONDS, PDO::PARAM_INT);
++        $stmt->execute();
++
++        $stmt = $this->db->prepare(
++            "UPDATE ChatCalls SET status = 'ended', ended_at = GETDATE()
++             WHERE status = 'accepted'
++             AND (last_activity_at IS NULL OR last_activity_at < DATEADD(SECOND, :activeTimeout, GETDATE()))
++             AND (answered_at IS NULL OR answered_at < DATEADD(SECOND, :activeTimeout, GETDATE()))"
+         );
+-        $stmt->bindValue(':timeout', -self::CALL_RING_TIMEOUT_SECONDS, PDO::PARAM_INT);
++        $stmt->bindValue(':activeTimeout', -self::CALL_STALE_ACTIVE_SECONDS, PDO::PARAM_INT);
++        $stmt->execute();
++    }
++
++    /** Marks $callId as still in use - called every time either side polls it, which happens every ~1.2s while a call is up (see pollCallProgress() in chat.js), so this is a free liveness signal with no extra requests. */
++    private function touchCallActivity(int $callId): void
++    {
++        $stmt = $this->db->prepare("UPDATE ChatCalls SET last_activity_at = GETDATE() WHERE call_id = :id");
++        $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
+         $stmt->execute();
+     }
+ 
+@@ -574,6 +601,8 @@ class Chat
+             return [null, 'Call not found.'];
+         }
+ 
++        $this->touchCallActivity($callId);
++
+         $stmt = $this->db->prepare("SELECT * FROM ChatCalls WHERE call_id = :id");
+         $stmt->bindValue(':id', $callId, PDO::PARAM_INT);
+         $stmt->execute();
+@@ -665,6 +694,7 @@ class Chat
+         if (!$participants || !in_array($userId, [$participants['caller_id'], $participants['callee_id']], true)) {
+             return [];
+         }
++        $this->touchCallActivity($callId);
+         $stmt = $this->db->prepare(
+             "SELECT signal_id, candidate FROM ChatCallSignals
+              WHERE call_id = :cid AND sender_id != :self AND signal_id > :since
+diff --git a/assets/css/style.css b/assets/css/style.css
+index 2a9f83e..8ed8eb6 100644
+--- a/assets/css/style.css
++++ b/assets/css/style.css
+@@ -1035,7 +1035,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: var(--pos-border
+ 
+ /* ---- Video calling ---- */
+ .pos-call-incoming {
+-    position: fixed; top: 16px; right: 16px; z-index: 1080;
++    position: fixed; top: 16px; right: 16px; z-index: 1095;
+     display: flex; align-items: center; gap: 14px;
+     background: var(--pos-ink-2, #1f2937); color: #fff;
+     padding: 12px 14px; border-radius: 12px;
+@@ -1053,7 +1053,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: var(--pos-border
+ .pos-call-btn.decline { background: #ef4444; }
+ 
+ .pos-call-overlay {
+-    position: fixed; inset: 0; z-index: 1090; background: #0b0f14;
++    position: fixed; inset: 0; z-index: 1096; background: #0b0f14;
+     display: flex; flex-direction: column;
+ }
+ .pos-call-remote-wrap { position: relative; flex: 1; min-height: 0; }
+diff --git a/assets/js/chat.js b/assets/js/chat.js
+index a8f17ec..4ffd7a1 100644
+--- a/assets/js/chat.js
++++ b/assets/js/chat.js
+@@ -39,6 +39,7 @@
+     let currentIncomingCall = null; // the call object currently shown on the incoming-call banner
+     let ringtoneCtx = null;
+     let ringtoneInterval = null;
++    let chatPanelWasOpenBeforeCall = false;
+ 
+     function escapeHtml(str) { return $('<div>').text(str == null ? '' : str).html(); }
+ 
+@@ -398,6 +399,12 @@
+ 
+     function openCallOverlay(initialStatus) {
+         $('#callOverlay').removeClass('d-none');
++        // The call overlay is full-screen, but hide the chat panel/toggle
++        // outright too rather than relying only on stacking order - no
++        // chance of a chat message or the floating button peeking through.
++        chatPanelWasOpenBeforeCall = !$('#chatPanel').hasClass('d-none');
++        $('#chatPanel').addClass('d-none');
++        $('#chatWidgetToggle').addClass('d-none');
+         $('#callMuteBtn, #callCameraBtn').addClass('active');
+         setCallStatusText(initialStatus);
+     }
+@@ -405,6 +412,7 @@
+     function endCallCleanup() {
+         clearInterval(callProgressTimer);
+         callProgressTimer = null;
++        ringtoneStop();
+         if (pc) { try { pc.close(); } catch (e) { /* ignore */ } pc = null; }
+         if (localStream) { localStream.getTracks().forEach(function (t) { t.stop(); }); localStream = null; }
+         activeCallId = null;
+@@ -412,6 +420,9 @@
+         iceSinceId = 0;
+         pendingLocalCandidates = [];
+         $('#callOverlay').addClass('d-none');
++        $('#chatWidgetToggle').removeClass('d-none');
++        if (chatPanelWasOpenBeforeCall) $('#chatPanel').removeClass('d-none');
++        chatPanelWasOpenBeforeCall = false;
+         const remoteVideo = document.getElementById('callRemoteVideo');
+         const localVideo = document.getElementById('callLocalVideo');
+         if (remoteVideo) remoteVideo.srcObject = null;
+@@ -435,6 +446,11 @@
+             const call = res.success ? res.call : null;
+             if (!call) { setCallStatusText('Call ended.'); setTimeout(endCallCleanup, 1000); return; }
+ 
++            // Ringback tone plays for the caller only while still actually
++            // ringing - stop it the moment the call moves past that,
++            // whichever way (answered, declined, missed).
++            if (call.status !== 'ringing') ringtoneStop();
++
+             if (activeCallRole === 'caller' && call.status === 'accepted' && call.answer_sdp && pc && !pc.currentRemoteDescription) {
+                 pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(call.answer_sdp)))
+                     .then(function () { setCallStatusText(''); })
+@@ -484,6 +500,7 @@
+             pendingLocalCandidates.forEach(sendIceCandidate);
+             pendingLocalCandidates = [];
+             setCallStatusText('Calling ' + (res.callee_name || '') + '...');
++            ringtoneStart(); // ringback while it's still ringing on the other end - stopped in pollCallProgress() the moment status changes
+             startCallPolling();
+         }).catch(function (err) {
+             if (err && err.responseJSON) { alert(err.responseJSON.message || 'Could not start the call.'); }
+diff --git a/database/migration_chat_calls_activity.sql b/database/migration_chat_calls_activity.sql
+new file mode 100644
+index 0000000..7f8241e
+--- /dev/null
++++ b/database/migration_chat_calls_activity.sql
+@@ -0,0 +1,26 @@
++/* =========================================================================
++   database/migration_chat_calls_activity.sql
++   -------------------------------------------------------------------------
++   Fixes a stuck "A call is already in progress in this conversation"
++   error: an accepted call had no way to expire on its own if one side
++   disconnected without a clean hangup (closed the tab, lost network,
++   phone locked, browser crashed - beforeunload/sendBeacon doesn't fire
++   reliably in any of those), leaving the row 'accepted' forever and
++   blocking every future call attempt in that conversation.
++
++   last_activity_at is refreshed every time either side polls
++   call_status or call_ice_candidates for that call (both already poll
++   every ~1.2s while a call is up - see assets/js/chat.js) - it's a
++   free liveness signal, no extra client requests needed. An 'accepted'
++   call nobody has polled in the last 20 seconds is assumed abandoned
++   and gets force-closed (see Chat::expireStaleCalls()).
++
++   Safe to re-run - only adds what's missing.
++   ========================================================================= */
++
++IF NOT EXISTS (
++    SELECT 1 FROM sys.columns
++    WHERE object_id = OBJECT_ID('dbo.ChatCalls') AND name = 'last_activity_at'
++)
++ALTER TABLE dbo.ChatCalls ADD last_activity_at DATETIME NULL;
++GO
+-- 
+2.43.0
+

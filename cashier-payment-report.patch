@@ -1,0 +1,457 @@
+From af091dd395fdf4195dd356855d477d5f19bac281 Mon Sep 17 00:00:00 2001
+From: Claude <assistant@example.com>
+Date: Sun, 30 Aug 2026 04:19:28 +0000
+Subject: [PATCH] Add Cashier & Payment Method report with Excel/PDF export
+
+New self-contained section on the Reports page (its own filters,
+independent of the main summary's date range above it):
+
+- app/models/Report.php: cashiersWithSales() (only cashiers who
+  actually rang up a sale in the range, for the dropdown),
+  cashierName(), and cashierPaymentBreakdown() - revenue grouped by
+  cashier AND payment method, optionally narrowed to one cashier
+  and/or one payment method. Reads from SalePayments rather than
+  Sales.payment_method for the same reason paymentBreakdown() already
+  does - a split-payment sale would otherwise dump entirely into an
+  unhelpful 'MULTIPLE' bucket.
+- app/controllers/ReportController.php: cashier_payment_breakdown
+  (JSON, for the on-page table), export_cashier_payment_excel and
+  export_cashier_payment_pdf (separate buttons/endpoints per the
+  request) - both reuse the existing dependency-free XlsxWriter/
+  PdfWriter helpers already used by the Item Ledger and Sales exports.
+- views/reports.php, assets/js/reports.js: cashier select (auto-
+  populated from sales in range), payment method select, date presets
+  (Today/Yesterday/This Week/This Month) plus a custom date-range
+  pair, a small summary strip, and the breakdown table.
+---
+ app/controllers/ReportController.php |  95 +++++++++++++++++++++++
+ app/models/Report.php                | 105 +++++++++++++++++++++++++
+ assets/js/reports.js                 | 111 +++++++++++++++++++++++++++
+ views/reports.php                    |  64 +++++++++++++++
+ 4 files changed, 375 insertions(+)
+
+diff --git a/app/controllers/ReportController.php b/app/controllers/ReportController.php
+index f61741e..c8a28d8 100644
+--- a/app/controllers/ReportController.php
++++ b/app/controllers/ReportController.php
+@@ -34,6 +34,9 @@ class ReportController
+             case 'summary':      $this->summary(); break;
+             case 'add_expense':  $this->addExpense(); break;
+             case 'delete_expense': $this->deleteExpense(); break;
++            case 'cashier_payment_breakdown':    $this->cashierPaymentBreakdown(); break;
++            case 'export_cashier_payment_excel': $this->exportCashierPaymentExcel(); break;
++            case 'export_cashier_payment_pdf':   $this->exportCashierPaymentPdf(); break;
+             default: Helper::jsonResponse(false, 'Unknown action.', [], 400);
+         }
+     }
+@@ -109,6 +112,98 @@ class ReportController
+ 
+         return [$validFrom, $validTo];
+     }
++
++    // -------------------------------------------------------------
++    // Cashier x Payment Method report (its own filters + Excel/PDF export)
++    // -------------------------------------------------------------
++
++    /** @return array [dateFrom, dateTo, cashierId|null, paymentMethod|null] */
++    private function resolveCashierPaymentFilters(): array
++    {
++        [$dateFrom, $dateTo] = $this->resolveDateRange();
++
++        $cashierId = (int) ($_GET['cashier_id'] ?? 0);
++        $cashierId = $cashierId > 0 ? $cashierId : null;
++
++        $paymentMethod = strtolower(trim((string) ($_GET['payment_method'] ?? '')));
++        $paymentMethod = array_key_exists($paymentMethod, Report::CASHIER_PAYMENT_METHODS) ? $paymentMethod : null;
++
++        return [$dateFrom, $dateTo, $cashierId, $paymentMethod];
++    }
++
++    private function cashierPaymentBreakdown(): void
++    {
++        [$dateFrom, $dateTo, $cashierId, $paymentMethod] = $this->resolveCashierPaymentFilters();
++        $result = $this->reportModel->cashierPaymentBreakdown($dateFrom, $dateTo, $cashierId, $paymentMethod);
++        $cashierName = $cashierId !== null ? ($this->reportModel->cashierName($cashierId) ?? 'Unknown Cashier') : 'All Cashiers';
++
++        Helper::jsonResponse(true, '', [
++            'date_from'      => $dateFrom,
++            'date_to'        => $dateTo,
++            'cashier_id'     => $cashierId,
++            'cashier_name'   => $cashierName,
++            'payment_method' => $paymentMethod,
++            'cashiers'       => $this->reportModel->cashiersWithSales($dateFrom, $dateTo),
++            'payment_methods' => Report::CASHIER_PAYMENT_METHODS,
++            'summary'        => $result['summary'],
++            'breakdown'      => $result['breakdown'],
++        ]);
++    }
++
++    /** @return array [dateFrom, dateTo, breakdown result, filenameLabel, titleLabel] shared by both export formats */
++    private function cashierPaymentExportData(): array
++    {
++        [$dateFrom, $dateTo, $cashierId, $paymentMethod] = $this->resolveCashierPaymentFilters();
++        $result = $this->reportModel->cashierPaymentBreakdown($dateFrom, $dateTo, $cashierId, $paymentMethod);
++        $cashierName = $cashierId !== null ? ($this->reportModel->cashierName($cashierId) ?? 'Unknown Cashier') : 'All Cashiers';
++
++        $labelParts = [$cashierName];
++        if ($paymentMethod !== null) {
++            $labelParts[] = Report::CASHIER_PAYMENT_METHODS[$paymentMethod];
++        }
++
++        return [$dateFrom, $dateTo, $result, implode(' - ', $labelParts)];
++    }
++
++    private function exportCashierPaymentExcel(): void
++    {
++        [$dateFrom, $dateTo, $result, $label] = $this->cashierPaymentExportData();
++
++        $headers = ['Cashier', 'Payment Method', 'Transactions', 'Revenue'];
++        $rows = [];
++        foreach ($result['breakdown'] as $row) {
++            $rows[] = [$row['cashier_name'], strtoupper($row['payment_method']), $row['transaction_count'], $row['revenue']];
++        }
++        $rows[] = ['TOTAL', '', $result['summary']['transaction_count'], $result['summary']['revenue']];
++
++        $sheetName = substr($label . ' ' . $dateFrom . ' to ' . $dateTo, 0, 31);
++        $filename = 'cashier_payment_report_' . preg_replace('/[^A-Za-z0-9]+/', '_', $label) . '_' . $dateFrom . '_to_' . $dateTo;
++
++        XlsxWriter::stream($filename, $headers, $rows, $sheetName);
++    }
++
++    private function exportCashierPaymentPdf(): void
++    {
++        [$dateFrom, $dateTo, $result, $label] = $this->cashierPaymentExportData();
++
++        $headers = ['Cashier', 'Payment Method', 'Transactions', 'Revenue'];
++        $colWidths = [190, 120, 90, 115];
++
++        $rows = [];
++        foreach ($result['breakdown'] as $row) {
++            $rows[] = [$row['cashier_name'], strtoupper($row['payment_method']), (string) $row['transaction_count'], number_format($row['revenue'], 2)];
++        }
++        $rows[] = ['TOTAL', '', (string) $result['summary']['transaction_count'], number_format($result['summary']['revenue'], 2)];
++
++        $title = 'Cashier & Payment Method Report - ' . $label;
++        $subtitle = $dateFrom . ' to ' . $dateTo
++            . ' | Transactions: ' . $result['summary']['transaction_count']
++            . ' | Revenue: ' . number_format($result['summary']['revenue'], 2)
++            . ' | Avg. Sale: ' . number_format($result['summary']['average_sale'], 2);
++        $filename = 'cashier_payment_report_' . preg_replace('/[^A-Za-z0-9]+/', '_', $label) . '_' . $dateFrom . '_to_' . $dateTo;
++
++        PdfWriter::stream($filename, $title, $subtitle, $headers, $colWidths, $rows);
++    }
+ }
+ 
+ if (basename($_SERVER['SCRIPT_FILENAME']) === basename(__FILE__)) {
+diff --git a/app/models/Report.php b/app/models/Report.php
+index 2888691..b5ffa89 100644
+--- a/app/models/Report.php
++++ b/app/models/Report.php
+@@ -267,4 +267,109 @@ class Report
+             'total_amount'  => round((float) $row['voided_amount'] + $refundAmount, 2),
+         ];
+     }
++
++    // -------------------------------------------------------------
++    // Cashier x Payment Method report (its own filterable report -
++    // separate from the main Reports page summary above)
++    // -------------------------------------------------------------
++
++    public const CASHIER_PAYMENT_METHODS = ['cash' => 'Cash', 'gcash' => 'GCash', 'maya' => 'Maya', 'card' => 'Card', 'check' => 'Check'];
++
++    /** Cashiers who actually rang up a completed sale in the range - populates the report's cashier dropdown with only relevant names instead of every registered user. */
++    public function cashiersWithSales(string $dateFrom, string $dateTo): array
++    {
++        $stmt = $this->db->prepare(
++            "SELECT DISTINCT u.user_id, u.full_name
++             FROM Sales s
++             INNER JOIN Users u ON u.user_id = s.user_id
++             WHERE s.status = 'completed' AND s.created_at BETWEEN :date_from AND :date_to
++             ORDER BY u.full_name ASC"
++        );
++        $stmt->bindValue(':date_from', $dateFrom . ' 00:00:00', PDO::PARAM_STR);
++        $stmt->bindValue(':date_to', $dateTo . ' 23:59:59', PDO::PARAM_STR);
++        $stmt->execute();
++
++        return array_map(function ($row) {
++            return ['user_id' => (int) $row['user_id'], 'full_name' => $row['full_name']];
++        }, $stmt->fetchAll());
++    }
++
++    /** A cashier's name for the report title/export filename when a specific one is selected. */
++    public function cashierName(int $userId): ?string
++    {
++        $stmt = $this->db->prepare("SELECT full_name FROM Users WHERE user_id = :id");
++        $stmt->bindValue(':id', $userId, PDO::PARAM_INT);
++        $stmt->execute();
++        $row = $stmt->fetch();
++        return $row ? $row['full_name'] : null;
++    }
++
++    /**
++     * Revenue broken down by cashier AND payment method, optionally
++     * narrowed to one cashier and/or one payment method. Reads from
++     * SalePayments (not Sales.payment_method) for the same reason as
++     * paymentBreakdown() above - a split-payment sale would otherwise
++     * dump entirely into an unhelpful "MULTIPLE" bucket instead of
++     * being attributed across the methods actually used.
++     *
++     * The summary total is simply the sum of the breakdown rows, so it
++     * always agrees with what's shown below it - including when a
++     * payment-method filter is active, where the total intentionally
++     * reflects only that method's revenue, not the full sale totals of
++     * every sale that happened to include it as one of several payments.
++     *
++     * @return array{summary: array, breakdown: array}
++     */
++    public function cashierPaymentBreakdown(string $dateFrom, string $dateTo, ?int $cashierId, ?string $paymentMethod): array
++    {
++        $conditions = ["s.status = 'completed'", "s.created_at BETWEEN :date_from AND :date_to"];
++        if ($cashierId !== null) {
++            $conditions[] = "s.user_id = :cashier_id";
++        }
++        if ($paymentMethod !== null) {
++            $conditions[] = "sp.payment_method = :payment_method";
++        }
++
++        $stmt = $this->db->prepare(
++            "SELECT u.user_id AS cashier_id, u.full_name AS cashier_name, sp.payment_method,
++                    COUNT(*) AS transaction_count, SUM(sp.amount) AS revenue
++             FROM SalePayments sp
++             INNER JOIN Sales s ON s.sale_id = sp.sale_id
++             INNER JOIN Users u ON u.user_id = s.user_id
++             WHERE " . implode(' AND ', $conditions) . "
++             GROUP BY u.user_id, u.full_name, sp.payment_method
++             ORDER BY u.full_name ASC, sp.payment_method ASC"
++        );
++        $stmt->bindValue(':date_from', $dateFrom . ' 00:00:00', PDO::PARAM_STR);
++        $stmt->bindValue(':date_to', $dateTo . ' 23:59:59', PDO::PARAM_STR);
++        if ($cashierId !== null) {
++            $stmt->bindValue(':cashier_id', $cashierId, PDO::PARAM_INT);
++        }
++        if ($paymentMethod !== null) {
++            $stmt->bindValue(':payment_method', $paymentMethod, PDO::PARAM_STR);
++        }
++        $stmt->execute();
++
++        $breakdown = array_map(function ($row) {
++            return [
++                'cashier_id'        => (int) $row['cashier_id'],
++                'cashier_name'      => $row['cashier_name'],
++                'payment_method'    => $row['payment_method'],
++                'transaction_count' => (int) $row['transaction_count'],
++                'revenue'           => round((float) $row['revenue'], 2),
++            ];
++        }, $stmt->fetchAll());
++
++        $totalTransactions = array_sum(array_column($breakdown, 'transaction_count'));
++        $totalRevenue = round(array_sum(array_column($breakdown, 'revenue')), 2);
++
++        return [
++            'summary' => [
++                'transaction_count' => $totalTransactions,
++                'revenue'           => $totalRevenue,
++                'average_sale'      => $totalTransactions > 0 ? round($totalRevenue / $totalTransactions, 2) : 0.0,
++            ],
++            'breakdown' => $breakdown,
++        ];
++    }
+ }
+diff --git a/assets/js/reports.js b/assets/js/reports.js
+index a0c2de8..ca93898 100644
+--- a/assets/js/reports.js
++++ b/assets/js/reports.js
+@@ -276,4 +276,115 @@
+             });
+         });
+     });
++    // -------------------------------------------------------------
++    // Cashier x Payment Method report (its own filters, independent of
++    // the date range above)
++    // -------------------------------------------------------------
++
++    function cprToDateInputValue(date) { return date.toISOString().slice(0, 10); }
++
++    function cprApplyPreset(preset) {
++        const today = new Date();
++        let from = new Date(today);
++        const to = new Date(today);
++
++        if (preset === 'yesterday') {
++            from.setDate(today.getDate() - 1);
++            to.setDate(today.getDate() - 1);
++        } else if (preset === 'week') {
++            from.setDate(today.getDate() - today.getDay()); // back to Sunday
++        } else if (preset === 'month') {
++            from = new Date(today.getFullYear(), today.getMonth(), 1);
++        }
++        // 'today' (the default): from/to stay today
++
++        $('#cprDateFrom').val(cprToDateInputValue(from));
++        $('#cprDateTo').val(cprToDateInputValue(to));
++        loadCashierPaymentReport();
++    }
++
++    function cprPopulateCashiers(cashiers) {
++        const $sel = $('#cprCashier');
++        const current = $sel.val();
++        $sel.find('option:not(:first)').remove();
++        cashiers.forEach(function (c) {
++            $sel.append(`<option value="${c.user_id}">${escapeHtml(c.full_name)}</option>`);
++        });
++        // Keep whichever cashier was selected, as long as they still have
++        // sales in the newly-loaded range - otherwise fall back to "All".
++        if (current && $sel.find(`option[value="${current}"]`).length) $sel.val(current);
++    }
++
++    function cprPopulatePaymentMethods(methods) {
++        const $sel = $('#cprPaymentMethod');
++        if ($sel.find('option').length > 1) return; // fixed list - only needs populating once
++        Object.keys(methods).forEach(function (key) {
++            $sel.append(`<option value="${key}">${escapeHtml(methods[key])}</option>`);
++        });
++    }
++
++    function cprRenderBreakdown(rows) {
++        const $body = $('#cprBody').empty();
++        if (!rows.length) {
++            $body.html('<tr><td colspan="4" class="text-center text-muted py-3">No sales in this range.</td></tr>');
++            return;
++        }
++        rows.forEach(function (row) {
++            $body.append(`
++                <tr>
++                    <td>${escapeHtml(row.cashier_name)}</td>
++                    <td><span class="badge pos-badge-muted text-uppercase">${escapeHtml(row.payment_method)}</span></td>
++                    <td class="text-end">${row.transaction_count}</td>
++                    <td class="text-end font-monospace">${money(row.revenue)}</td>
++                </tr>
++            `);
++        });
++    }
++
++    function cprUpdateExportLinks(params) {
++        $('#cprExportExcel').attr('href', ENDPOINT + '?action=export_cashier_payment_excel&' + params).removeClass('disabled');
++        $('#cprExportPdf').attr('href', ENDPOINT + '?action=export_cashier_payment_pdf&' + params).removeClass('disabled');
++    }
++
++    function loadCashierPaymentReport() {
++        const dateFrom = $('#cprDateFrom').val();
++        const dateTo = $('#cprDateTo').val();
++        if (!dateFrom || !dateTo) return;
++
++        const query = {
++            action: 'cashier_payment_breakdown',
++            date_from: dateFrom,
++            date_to: dateTo,
++            cashier_id: $('#cprCashier').val(),
++            payment_method: $('#cprPaymentMethod').val(),
++        };
++
++        $.get(ENDPOINT, query).done(function (res) {
++            if (!res.success) return;
++            cprPopulateCashiers(res.cashiers);
++            cprPopulatePaymentMethods(res.payment_methods);
++            $('#cprStatTransactions').text(res.summary.transaction_count);
++            $('#cprStatRevenue').text(money(res.summary.revenue));
++            $('#cprStatAverage').text(money(res.summary.average_sale));
++            cprRenderBreakdown(res.breakdown);
++            cprUpdateExportLinks($.param(query));
++        });
++    }
++
++    $(function () {
++        if (!$('#cprBody').length) return;
++
++        cprApplyPreset('today');
++
++        $('#cprPresets').on('click', 'button', function () {
++            $('#cprPresets button').removeClass('active');
++            $(this).addClass('active');
++            cprApplyPreset($(this).data('preset'));
++        });
++        $('#cprDateFrom, #cprDateTo').on('change', function () {
++            $('#cprPresets button').removeClass('active');
++            loadCashierPaymentReport();
++        });
++        $('#cprCashier, #cprPaymentMethod').on('change', loadCashierPaymentReport);
++    });
+ })(jQuery);
+diff --git a/views/reports.php b/views/reports.php
+index f520f3c..4396de5 100644
+--- a/views/reports.php
++++ b/views/reports.php
+@@ -148,6 +148,70 @@ if (!defined('POS_APP')) {
+     </div>
+ </div>
+ 
++<div class="row g-3 mt-1">
++    <div class="col-12">
++        <div class="card pos-card border-0 shadow-sm">
++            <div class="card-body">
++                <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
++                    <h2 class="h6 mb-0">Cashier &amp; Payment Method Report</h2>
++                    <div class="d-flex gap-2">
++                        <a href="#" class="btn btn-outline-secondary btn-sm disabled" id="cprExportExcel" target="_blank" rel="noopener"><i class="bi bi-file-earmark-excel me-1"></i>Export to Excel</a>
++                        <a href="#" class="btn btn-outline-secondary btn-sm disabled" id="cprExportPdf" target="_blank" rel="noopener"><i class="bi bi-file-earmark-pdf me-1"></i>Export to PDF</a>
++                    </div>
++                </div>
++
++                <div class="d-flex gap-2 flex-wrap align-items-center mb-3">
++                    <select class="form-select form-select-sm pos-select" id="cprCashier" style="max-width: 200px;">
++                        <option value="">All Cashiers</option>
++                    </select>
++                    <select class="form-select form-select-sm pos-select" id="cprPaymentMethod" style="max-width: 170px;">
++                        <option value="">All Payment Methods</option>
++                    </select>
++                    <div class="btn-group btn-group-sm" role="group" id="cprPresets">
++                        <button type="button" class="btn btn-outline-secondary active" data-preset="today">Today</button>
++                        <button type="button" class="btn btn-outline-secondary" data-preset="yesterday">Yesterday</button>
++                        <button type="button" class="btn btn-outline-secondary" data-preset="week">This Week</button>
++                        <button type="button" class="btn btn-outline-secondary" data-preset="month">This Month</button>
++                    </div>
++                    <input type="date" class="form-control form-control-sm pos-select" id="cprDateFrom" style="max-width: 150px;">
++                    <span class="text-muted small">to</span>
++                    <input type="date" class="form-control form-control-sm pos-select" id="cprDateTo" style="max-width: 150px;">
++                </div>
++
++                <div class="row g-3 mb-3">
++                    <div class="col-6 col-md-4">
++                        <div class="card pos-card border-0 bg-body-secondary h-100"><div class="card-body py-2">
++                            <div class="text-muted small mb-1">Transactions</div>
++                            <div class="h5 mb-0" id="cprStatTransactions">0</div>
++                        </div></div>
++                    </div>
++                    <div class="col-6 col-md-4">
++                        <div class="card pos-card border-0 bg-body-secondary h-100"><div class="card-body py-2">
++                            <div class="text-muted small mb-1">Revenue</div>
++                            <div class="h5 mb-0" id="cprStatRevenue">₱0.00</div>
++                        </div></div>
++                    </div>
++                    <div class="col-6 col-md-4">
++                        <div class="card pos-card border-0 bg-body-secondary h-100"><div class="card-body py-2">
++                            <div class="text-muted small mb-1">Average Sale</div>
++                            <div class="h5 mb-0" id="cprStatAverage">₱0.00</div>
++                        </div></div>
++                    </div>
++                </div>
++
++                <div class="table-responsive">
++                    <table class="table pos-table align-middle mb-0">
++                        <thead>
++                            <tr><th>Cashier</th><th>Payment Method</th><th class="text-end">Transactions</th><th class="text-end">Revenue</th></tr>
++                        </thead>
++                        <tbody id="cprBody"><tr><td colspan="4" class="text-center text-muted py-3">Loading...</td></tr></tbody>
++                    </table>
++                </div>
++            </div>
++        </div>
++    </div>
++</div>
++
+ <!-- Add Expense modal -->
+ <div class="modal fade" id="expenseModal" tabindex="-1" aria-hidden="true">
+     <div class="modal-dialog">
+-- 
+2.43.0
+
